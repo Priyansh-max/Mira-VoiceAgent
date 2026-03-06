@@ -11,76 +11,62 @@ const typeLabel = (type) => {
     tool_call: 'Tool call',
     tool_result: 'Tool result',
     response: 'Response',
+    realtime_session: 'Realtime session',
+    realtime_event: 'Realtime event',
+    user_transcript: 'User transcript',
+    assistant_transcript: 'Assistant transcript',
+    realtime_error: 'Realtime error',
   };
   return map[type] || type;
 };
 
-export default function TracePanel({ sessionId }) {
-  const [events, setEvents] = useState([]);
+export default function TracePanel({ sessionId, externalEvents = [], onTraceError, compact = false }) {
+  const [backendEvents, setBackendEvents] = useState([]);
 
   useEffect(() => {
     if (!sessionId) {
-      setEvents([]);
+      setBackendEvents([]);
       return;
     }
     const unsub = traceEventSource(
       sessionId,
-      (ev) => setEvents((prev) => [...prev, ev]),
-      () => {}
+      (ev) => setBackendEvents((prev) => [...prev, ev]),
+      onTraceError
     );
     return unsub;
-  }, [sessionId]);
+  }, [sessionId, onTraceError]);
+
+  const events = [...backendEvents, ...externalEvents].sort((a, b) => (a.ts || 0) - (b.ts || 0));
 
   return (
-    <div
-      style={{
-        flex: '1 1 280px',
-        minHeight: 200,
-        background: '#16213e',
-        borderRadius: 8,
-        padding: '0.75rem',
-        overflow: 'auto',
-        fontFamily: 'monospace',
-        fontSize: '0.85rem',
-      }}
-    >
-      <div style={{ marginBottom: '0.5rem', fontWeight: 600, color: '#a0a0a0' }}>
+    <div className={`rounded-[22px] border border-white/65 bg-white/48 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.68)] ${compact ? 'flex h-full min-h-0 flex-col' : 'min-h-[32rem]'}`}>
+      <div className="mb-3 text-sm font-semibold text-slate-600">
         Agent trace {sessionId ? `(session ${sessionId.slice(0, 8)}…)` : ''}
       </div>
-      {events.length === 0 && sessionId && (
-        <div style={{ color: '#666' }}>Listening for events… Send a message to see trace.</div>
-      )}
-      {events.length === 0 && !sessionId && (
-        <div style={{ color: '#666' }}>Start a session to see the trace.</div>
-      )}
-      {events.map((ev, i) => (
-        <div
-          key={i}
-          style={{
-            marginBottom: '0.5rem',
-            padding: '0.35rem 0.5rem',
-            background: 'rgba(255,255,255,0.06)',
-            borderRadius: 4,
-            borderLeft: '3px solid #3498db',
-          }}
-        >
-          <span style={{ color: '#3498db', fontWeight: 600 }}>{typeLabel(ev.type)}</span>
-          <span style={{ color: '#bdc3c7', marginLeft: '0.5rem' }}>{ev.message}</span>
-          {ev.data && Object.keys(ev.data).length > 0 && (
-            <pre
-              style={{
-                margin: '0.25rem 0 0',
-                fontSize: '0.75rem',
-                color: '#95a5a6',
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-word',
-              }}
-            >
-              {JSON.stringify(ev.data)}
-            </pre>
-          )}
-        </div>
-      ))}
+      <div className={`hide-scrollbar overflow-y-auto pr-1 ${compact ? 'min-h-0 flex-1' : 'h-[calc(100%-2rem)]'}`}>
+        {events.length === 0 && sessionId && (
+          <div className="text-sm text-slate-400">Listening for events… Send a message to see trace.</div>
+        )}
+        {events.length === 0 && !sessionId && (
+          <div className="text-sm text-slate-400">Start a session to see the trace.</div>
+        )}
+        {events.map((ev, i) => (
+          <div
+            key={i}
+            className="mb-3 rounded-2xl border-l-[3px] border-l-[#58a6b2] bg-[linear-gradient(180deg,rgba(247,251,251,0.94),rgba(241,247,247,0.88))] px-3 py-3 last:mb-0"
+          >
+            <div className="flex flex-wrap gap-2 text-sm">
+              <span className="font-semibold text-[#2b7a78]">{typeLabel(ev.type)}</span>
+              <span className="text-slate-500">{ev.message}</span>
+            </div>
+            {ev.data && Object.keys(ev.data).length > 0 && (
+              <pre className="mt-2 whitespace-pre-wrap break-words text-[12px] text-slate-500">
+                {JSON.stringify(ev.data)}
+              </pre>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

@@ -66,44 +66,24 @@ export default function ChatPanel({ sessionId, onError }) {
   }, []);
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', minHeight: 0 }}>
-      <div
-        style={{
-          flex: 1,
-          minHeight: 120,
-          overflow: 'auto',
-          background: '#16213e',
-          borderRadius: 8,
-          padding: '0.75rem',
-        }}
-      >
+    <div className="debug-panel">
+      <div className="debug-feed">
         {messages.length === 0 && (
-          <div style={{ color: '#666' }}>Send a voice or text message to start.</div>
+          <div className="empty-copy">Send a voice or text message to start.</div>
         )}
         {messages.map((m, i) => (
           <div
             key={i}
-            style={{
-              textAlign: m.role === 'user' ? 'right' : 'left',
-              marginBottom: '0.5rem',
-            }}
+            className={`message-row ${m.role === 'user' ? 'user' : 'assistant'}`}
           >
-            <span
-              style={{
-                display: 'inline-block',
-                padding: '0.4rem 0.75rem',
-                borderRadius: 8,
-                maxWidth: '85%',
-                background: m.role === 'user' ? '#3498db' : 'rgba(255,255,255,0.1)',
-              }}
-            >
+            <span className={`message-bubble ${m.role === 'user' ? 'user' : 'assistant'}`}>
               {m.text}
             </span>
           </div>
         ))}
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-        <label style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', cursor: 'pointer' }}>
+      <div className="chat-toolbar">
+        <label className="toggle-label">
           <input
             type="checkbox"
             checked={ttsOn}
@@ -113,7 +93,7 @@ export default function ChatPanel({ sessionId, onError }) {
         </label>
       </div>
       <VoiceRecorder onTranscript={handleTranscript} disabled={!sessionId || loading} />
-      <div style={{ display: 'flex', gap: '0.5rem' }}>
+      <div className="composer-row">
         <input
           type="text"
           placeholder="Or type a message…"
@@ -121,28 +101,13 @@ export default function ChatPanel({ sessionId, onError }) {
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && sendText(input)}
           disabled={!sessionId || loading}
-          style={{
-            flex: 1,
-            padding: '0.5rem 0.75rem',
-            borderRadius: 8,
-            border: '1px solid #333',
-            background: '#0f0f1a',
-            color: '#eee',
-          }}
+          className="composer-input"
         />
         <button
           type="button"
           onClick={() => sendText(input).then(() => setInput(''))}
           disabled={!sessionId || loading || !input.trim()}
-          style={{
-            padding: '0.5rem 1rem',
-            borderRadius: 8,
-            border: 'none',
-            background: '#2ecc71',
-            color: '#fff',
-            cursor: 'pointer',
-            fontWeight: 600,
-          }}
+          className="composer-button"
         >
           Send
         </button>

@@ -41,24 +41,16 @@ export default function VoiceRecorder({ onTranscript, disabled }) {
   }, []);
 
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+    <div className="recorder-row">
       <button
         type="button"
         onClick={recording ? stop : start}
         disabled={disabled}
-        style={{
-          padding: '0.6rem 1rem',
-          borderRadius: 8,
-          border: 'none',
-          background: recording ? '#e74c3c' : '#3498db',
-          color: '#fff',
-          cursor: disabled ? 'not-allowed' : 'pointer',
-          fontWeight: 600,
-        }}
+        className={`recorder-button ${recording ? 'recording' : ''}`}
       >
         {recording ? 'Stop' : 'Hold to talk'}
       </button>
-      {error && <span style={{ color: '#e74c3c', fontSize: '0.9rem' }}>{error}</span>}
+      {error && <span className="recorder-error">{error}</span>}
     </div>
   );
 }

@@ -1,7 +1,13 @@
-const API = '/api';
+const API = 'http://127.0.0.1:8000';
 
 export async function createSession() {
   const res = await fetch(`${API}/sessions`, { method: 'POST' });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function checkHealth() {
+  const res = await fetch(`${API}/health`);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -11,6 +17,26 @@ export async function chat(sessionId, text) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ session_id: sessionId, text }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function createRealtimeSession() {
+  const res = await fetch(`${API}/realtime/session`, { method: 'POST' });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function executeRealtimeTool(sessionId, toolName, toolArgs = {}) {
+  const res = await fetch(`${API}/realtime/tool`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      session_id: sessionId,
+      tool_name: toolName,
+      tool_args: toolArgs,
+    }),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
@@ -55,7 +81,7 @@ export function traceEventSource(sessionId, onEvent, onError) {
     } catch (_) {}
   };
   es.onerror = () => {
-    onError?.();
+    onError?.(new Error(`Trace stream failed for session ${sessionId}`));
     es.close();
   };
   return () => es.close();

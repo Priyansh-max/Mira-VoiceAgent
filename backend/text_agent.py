@@ -69,12 +69,7 @@ class OpenAITextAgent:
         return any(phrase in lowered for phrase in closing_phrases)
 
     def _looks_like_bare_full_name(self, text: str) -> bool:
-        cleaned = text.strip()
-        if not cleaned or any(ch.isdigit() for ch in cleaned):
-            return False
-        if len(cleaned.split()) < 2 or len(cleaned.split()) > 4:
-            return False
-        return all(re.fullmatch(r"[A-Za-z][A-Za-z\-']*", part) for part in cleaned.split())
+        return self._extract_name_candidate(text) is not None
 
     def _explicitly_mentions_phone_verification(self, text: str) -> bool:
         lowered = text.lower()
@@ -157,8 +152,80 @@ class OpenAITextAgent:
                 return match.group(1).strip()
         return None
 
+    def _extract_name_candidate(self, text: str) -> Optional[str]:
+        tokens = re.findall(r"[A-Za-z][A-Za-z\-']*", text)
+        if len(tokens) < 2:
+            return None
+
+        filler_words = {
+            "a",
+            "actually",
+            "am",
+            "call",
+            "callback",
+            "case",
+            "check",
+            "digits",
+            "full",
+            "hello",
+            "help",
+            "hey",
+            "hi",
+            "i",
+            "id",
+            "im",
+            "is",
+            "it",
+            "its",
+            "last",
+            "lookup",
+            "me",
+            "my",
+            "name",
+            "need",
+            "number",
+            "of",
+            "okay",
+            "ok",
+            "order",
+            "phone",
+            "please",
+            "refund",
+            "schedule",
+            "status",
+            "support",
+            "sure",
+            "text",
+            "that",
+            "the",
+            "this",
+            "ticket",
+            "tomorrow",
+            "up",
+            "want",
+            "yes",
+        }
+
+        start = 0
+        end = len(tokens)
+        while start < end and tokens[start].lower() in filler_words:
+            start += 1
+        while end > start and tokens[end - 1].lower() in filler_words:
+            end -= 1
+
+        candidate_tokens = tokens[start:end]
+        if len(candidate_tokens) < 2 or len(candidate_tokens) > 4:
+            return None
+        if any(token.lower() in filler_words for token in candidate_tokens):
+            return None
+        return " ".join(candidate_tokens)
+
     def _normalize_intent(self, raw_intent: str | None, session: SessionState) -> str:
         allowed = {"lookup_ticket", "order_status", "schedule_callback", "general_query"}
+        # Always allow an explicit callback request to override a pending
+        # protected lookup flow. This is the safe human-escalation exit path.
+        if raw_intent == "schedule_callback":
+            return "schedule_callback"
         # During a protected verification flow, keep the user's pending goal stable
         # instead of letting the planner drift between lookup/order/verify intents.
         if session.pending_intent in allowed and not session.verified:
@@ -207,21 +274,23 @@ class OpenAITextAgent:
         )
 
     def _apply_plan_to_session(self, *, session: SessionState, plan: Dict[str, Any], text: str) -> None:
-        extracted_full_name = self._extract_full_name(text)
-        if not extracted_full_name and session.last_policy_code == "need_full_name" and self._looks_like_bare_full_name(text):
-            extracted_full_name = text.strip()
-
+        extracted_full_name = None
         tool_args = plan.get("tool_args") or {}
         tool_arg_full_name = tool_args.get("full_name") or tool_args.get("name")
         if (
-            not extracted_full_name
-            and isinstance(tool_arg_full_name, str)
+            isinstance(tool_arg_full_name, str)
             and len(tool_arg_full_name.strip().split()) >= 2
         ):
-            extracted_full_name = tool_arg_full_name.strip()
+            extracted_full_name = self._extract_name_candidate(tool_arg_full_name) or tool_arg_full_name.strip()
+
+        if not extracted_full_name:
+            extracted_full_name = self._extract_full_name(text)
+
+        if not extracted_full_name and session.last_policy_code == "need_full_name":
+            extracted_full_name = self._extract_name_candidate(text)
 
         if extracted_full_name:
-            session.claimed_name = extracted_full_name
+            session.claimed_name = extracted_full_name.strip()
         elif plan.get("user_name"):
             proposed_name = str(plan["user_name"]).strip()
             # Preserve the most specific identity the caller has already provided.
@@ -332,7 +401,8 @@ class OpenAITextAgent:
             )
         )
 
-        intent = self._normalize_intent(plan.get("intent"), session)
+        raw_intent = plan.get("intent")
+        intent = self._normalize_intent(raw_intent, session)
         if self._is_sensitive_intent(intent):
             session.pending_intent = intent
         trace.emit(
@@ -340,7 +410,11 @@ class OpenAITextAgent:
                 session_id=session.session_id,
                 type="intent",
                 message=f"Intent detected: {intent}",
-                data={"intent": intent},
+                data={
+                    "intent": intent,
+                    "raw_intent": raw_intent,
+                    "pending_intent": session.pending_intent,
+                },
             )
         )
 
@@ -510,6 +584,7 @@ class OpenAITextAgent:
             phone_last4 = str(
                 tool_args.get("phone_last4")
                 or plan.get("phone_last4")
+                or session.phone_last4
                 or ""
             ).strip()
             if not phone_last4:
@@ -609,7 +684,7 @@ class OpenAITextAgent:
                 }
 
         elif tool_name == "lookup_ticket":
-            case_id = str(tool_args.get("case_id") or tool_args.get("ticket_id") or "").strip()
+            case_id = str(tool_args.get("case_id") or tool_args.get("ticket_id") or session.ticket_id or "").strip()
             if not case_id:
                 return None
             session.ticket_id = case_id
@@ -634,7 +709,7 @@ class OpenAITextAgent:
             result = {"tool": "lookup_ticket", **raw_result}
 
         elif tool_name == "get_order_status":
-            order_id = str(tool_args.get("order_id") or "").strip()
+            order_id = str(tool_args.get("order_id") or session.order_id or "").strip()
             if not order_id:
                 return None
             session.order_id = order_id
@@ -694,6 +769,164 @@ class OpenAITextAgent:
             )
         )
         return result
+
+    def _intent_for_tool_name(self, tool_name: str, session: SessionState) -> str:
+        direct_map = {
+            "lookup_ticket": "lookup_ticket",
+            "get_order_status": "order_status",
+            "schedule_callback": "schedule_callback",
+        }
+        if tool_name in direct_map:
+            return direct_map[tool_name]
+        if session.pending_intent in {"lookup_ticket", "order_status", "schedule_callback"}:
+            return str(session.pending_intent)
+        if session.ticket_id:
+            return "lookup_ticket"
+        if session.order_id:
+            return "order_status"
+        return "general_query"
+
+    def execute_realtime_tool(
+        self,
+        *,
+        session: SessionState,
+        trace: TraceStore,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        normalized_args = tool_args if isinstance(tool_args, dict) else {}
+
+        name_value = normalized_args.get("full_name") or normalized_args.get("name")
+        if isinstance(name_value, str):
+            extracted_name = (
+                self._extract_name_candidate(name_value)
+                or self._extract_full_name(name_value)
+                or name_value.strip()
+            )
+            if extracted_name:
+                session.claimed_name = extracted_name.strip()
+                if not session.user_name:
+                    session.user_name = session.claimed_name
+
+        phone_last4 = normalized_args.get("phone_last4")
+        if isinstance(phone_last4, str) and re.fullmatch(r"\d{4}", phone_last4.strip()):
+            session.phone_last4 = phone_last4.strip()
+
+        customer_id = normalized_args.get("customer_id")
+        if isinstance(customer_id, str) and customer_id.strip():
+            session.customer_id = customer_id.strip()
+
+        ticket_id = normalized_args.get("case_id") or normalized_args.get("ticket_id")
+        if isinstance(ticket_id, str) and ticket_id.strip():
+            session.ticket_id = ticket_id.strip()
+
+        order_id = normalized_args.get("order_id")
+        if isinstance(order_id, str) and order_id.strip():
+            session.order_id = order_id.strip()
+
+        if tool_name == "lookup_ticket":
+            session.pending_intent = "lookup_ticket"
+        elif tool_name == "get_order_status":
+            session.pending_intent = "order_status"
+
+        if tool_name == "identify_customer" and not session.claimed_name:
+            policy_outcome = self._build_policy_outcome(
+                code="need_full_name",
+                safe_facts={},
+                allowed_next_steps=["Ask for the customer's full name."],
+            )
+            session.last_policy_code = policy_outcome["code"]
+            return {
+                "tool_name": tool_name,
+                "tool_result": None,
+                "policy_outcome": policy_outcome,
+                "session_state": self._session_snapshot(session),
+            }
+
+        if tool_name == "verify_customer" and not (session.phone_last4 or normalized_args.get("phone_last4")):
+            policy_outcome = self._build_policy_outcome(
+                code="need_phone_last4",
+                safe_facts={"customer_full_name": session.customer_full_name},
+                allowed_next_steps=["Ask for the last 4 digits of the phone number."],
+            )
+            session.last_policy_code = policy_outcome["code"]
+            return {
+                "tool_name": tool_name,
+                "tool_result": None,
+                "policy_outcome": policy_outcome,
+                "session_state": self._session_snapshot(session),
+            }
+
+        if tool_name == "lookup_ticket" and not session.ticket_id:
+            policy_outcome = self._build_policy_outcome(
+                code="need_ticket_id",
+                safe_facts={},
+                allowed_next_steps=["Ask for the ticket ID."],
+            )
+            session.last_policy_code = policy_outcome["code"]
+            return {
+                "tool_name": tool_name,
+                "tool_result": None,
+                "policy_outcome": policy_outcome,
+                "session_state": self._session_snapshot(session),
+            }
+
+        if tool_name == "get_order_status" and not session.order_id:
+            policy_outcome = self._build_policy_outcome(
+                code="need_order_id",
+                safe_facts={},
+                allowed_next_steps=["Ask for the order ID."],
+            )
+            session.last_policy_code = policy_outcome["code"]
+            return {
+                "tool_name": tool_name,
+                "tool_result": None,
+                "policy_outcome": policy_outcome,
+                "session_state": self._session_snapshot(session),
+            }
+
+        tool_result = self._run_tool(
+            session=session,
+            trace=trace,
+            plan={"tool_name": tool_name, "tool_args": normalized_args},
+        )
+        if tool_result is None:
+            raise TextAgentConfigError(f"Realtime requested unsupported or invalid tool call: {tool_name}")
+
+        intent = self._intent_for_tool_name(tool_name, session)
+        policy_outcome = self._policy_outcome_from_tool_result(
+            session=session,
+            intent=intent,
+            tool_result=tool_result,
+        )
+        session.last_policy_code = policy_outcome["code"]
+        trace.emit(
+            TraceEvent(
+                session_id=session.session_id,
+                type="policy_outcome",
+                message=f"Policy outcome: {policy_outcome['code']}",
+                data=policy_outcome,
+            )
+        )
+        return {
+            "tool_name": tool_name,
+            "tool_result": tool_result,
+            "policy_outcome": policy_outcome,
+            "session_state": self._session_snapshot(session),
+        }
+
+    def _session_snapshot(self, session: SessionState) -> Dict[str, Any]:
+        return {
+            "claimed_name": session.claimed_name,
+            "customer_id": session.customer_id,
+            "customer_full_name": session.customer_full_name,
+            "verified": session.verified,
+            "phone_last4": session.phone_last4,
+            "pending_intent": session.pending_intent,
+            "ticket_id": session.ticket_id,
+            "order_id": session.order_id,
+            "last_policy_code": session.last_policy_code,
+        }
 
     def _build_policy_outcome(
         self,
@@ -1033,6 +1266,21 @@ class OpenAITextAgent:
                 allowed_next_steps=[
                     "Offer to schedule a callback with a human support agent.",
                 ],
+            )
+
+        # A direct escalation request should not be blocked by a pending lookup.
+        if intent == "schedule_callback":
+            tool_result = self._run_tool(session=session, trace=trace, plan=plan)
+            if tool_result is None:
+                return self._build_policy_outcome(
+                    code="general_reply",
+                    safe_facts={},
+                    allowed_next_steps=["Offer to schedule a callback with a human support agent."],
+                )
+            return self._policy_outcome_from_tool_result(
+                session=session,
+                intent=intent,
+                tool_result=tool_result,
             )
 
         if self._is_sensitive_intent(intent) or (

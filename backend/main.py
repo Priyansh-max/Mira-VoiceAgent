@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -63,6 +63,19 @@ class RealtimeSessionResponse(BaseModel):
     realtime_session: dict
 
 
+class RealtimeToolRequest(BaseModel):
+    session_id: str
+    tool_name: str
+    tool_args: dict[str, Any] = Field(default_factory=dict)
+
+
+class RealtimeToolResponse(BaseModel):
+    tool_name: str
+    tool_result: Optional[dict] = None
+    policy_outcome: dict
+    session_state: dict
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True}
@@ -114,6 +127,26 @@ def create_realtime_session() -> RealtimeSessionResponse:
         expires_at=realtime["expires_at"],
         realtime_session=realtime["session"],
     )
+
+
+@app.post("/realtime/tool", response_model=RealtimeToolResponse)
+def execute_realtime_tool(req: RealtimeToolRequest) -> RealtimeToolResponse:
+    try:
+        session = conversations.get_session(req.session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown session_id")
+
+    try:
+        result = text_agent.execute_realtime_tool(
+            session=session,
+            trace=traces,
+            tool_name=req.tool_name,
+            tool_args=req.tool_args,
+        )
+    except TextAgentConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return RealtimeToolResponse(**result)
 
 
 # LEGACY ENDPOINT:

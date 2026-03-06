@@ -411,7 +411,7 @@ export default function RealtimeVoicePanel({
             <div className="relative mx-auto mb-3 flex h-20 w-20 items-center justify-center rounded-full bg-[radial-gradient(circle_at_35%_35%,#b5eff1_0%,#79bfd3_42%,#5f87c7_100%)] text-sm font-semibold text-white shadow-[0_12px_24px_rgba(95,135,199,0.18)]">
               AI
             </div>
-            <div className="relative text-base font-semibold text-slate-900">Mint</div>
+            <div className="relative text-base font-semibold text-slate-900">Mira</div>
             <div className="relative mt-1 text-sm text-slate-500">
               {isAgentSpeaking ? 'Responding now' : 'Voice agent'}
             </div>

@@ -91,7 +91,7 @@ export default function App() {
         <header className="flex flex-wrap items-start justify-between gap-4">
           <div className="max-w-3xl">
             <h1 className="text-4xl ml-4 font-semibold leading-tight tracking-[-0.03em] text-slate-900 sm:text-5xl">
-              {route === '/legacy' ? 'Legacy Implementation' : 'Mint Customer Agent'}
+              {route === '/legacy' ? 'Legacy Implementation' : 'Mira Customer Agent'}
             </h1>
             <p className="mt-3 max-w-2xl text-sm text-slate-500 sm:text-base">
               {route === '/legacy'

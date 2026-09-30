@@ -7,6 +7,8 @@ import {
   recordLatencyTurn,
 } from '../api';
 import LatencyPanel from './LatencyPanel';
+import LiveConversationPanel from './LiveConversationPanel';
+import DemoDataPanel from './DemoDataPanel';
 
 const OPENAI_REALTIME_URL = 'https://api.openai.com/v1/realtime/calls';
 const AUDIO_RMS_THRESHOLD = 0.018;
@@ -180,6 +182,7 @@ export default function RealtimeVoicePanel({
   const [isAgentSpeaking, setIsAgentSpeaking] = useState(false);
   const [latencySummary, setLatencySummary] = useState(null);
   const [latencyTurns, setLatencyTurns] = useState([]);
+  const [demoDataOpen, setDemoDataOpen] = useState(false);
 
   const pcRef = useRef(null);
   const dcRef = useRef(null);
@@ -288,6 +291,7 @@ export default function RealtimeVoicePanel({
     setEventLog([]);
     setRealtimeMeta(null);
     setLatencyTurns([]);
+    setDemoDataOpen(false);
     setIsUserSpeaking(false);
     setIsAgentSpeaking(false);
     setStatus('idle');
@@ -321,11 +325,13 @@ export default function RealtimeVoicePanel({
     const { callId, name, arguments: toolArgs } = functionCall;
 
     try {
+      const toolEvents = [];
       if (activeTurnRef.current) {
         activeTurnRef.current.hasToolCall = true;
         activeTurnRef.current.toolStartedAt = performance.now();
       }
       let toolResponse = await executeRealtimeTool(appSessionId, name, toolArgs);
+      toolEvents.push({ tool_name: name, input: toolArgs, response: toolResponse });
       const chainedCalls = new Set();
       while (['ready_for_lookup', 'route_to_callback', 'route_to_identity'].includes(toolResponse.action)) {
         const nextTool = toolResponse.action === 'ready_for_lookup'
@@ -336,7 +342,7 @@ export default function RealtimeVoicePanel({
         const chainKey = `${nextTool}:${toolResponse.purpose}`;
         if (chainedCalls.has(chainKey)) throw new Error('Tool continuation loop detected');
         chainedCalls.add(chainKey);
-        toolResponse = await executeRealtimeTool(appSessionId, nextTool, {
+        const nextArgs = {
           purpose: toolResponse.purpose,
           caller_name: toolResponse.caller_name || null,
           caller_phone: toolResponse.caller_phone || null,
@@ -344,13 +350,25 @@ export default function RealtimeVoicePanel({
           ticket_id: toolResponse.ticket_id || null,
           callback_time: toolResponse.callback_time || null,
           attempt: toolResponse.attempt,
-        });
+        };
+        toolResponse = await executeRealtimeTool(appSessionId, nextTool, nextArgs);
+        toolEvents.push({ tool_name: nextTool, input: nextArgs, response: toolResponse });
       }
       if (!mountedRef.current || sessionIdRef.current !== appSessionId) return;
       if (activeTurnRef.current) {
         activeTurnRef.current.toolCompletedAt = performance.now();
         activeTurnRef.current.responseMode = toolResponse.response_mode;
       }
+      setEventLog((previous) => [
+        ...previous.slice(-19),
+        {
+          ts: Date.now() / 1000,
+          session_id: appSessionId,
+          type: 'tool_exchange',
+          message: 'Tool request and response',
+          data: { tool_calls: toolEvents },
+        },
+      ]);
 
       const modelToolResponse = toolResponse.response_mode === 'speech_directive'
         ? toolResponse
@@ -426,6 +444,7 @@ export default function RealtimeVoicePanel({
     setStatus('connecting');
     setEventLog([]);
     setLatencyTurns([]);
+    setDemoDataOpen(false);
 
     try {
       await cleanupPromiseRef.current;
@@ -652,12 +671,31 @@ export default function RealtimeVoicePanel({
       : status === 'connected'
         ? 'ready'
         : status;
-  const latestUserTranscript = [...eventLog]
-    .reverse()
-    .find((event) => event.type === 'user_transcript')?.data?.text;
-  const latestAgentTranscript = [...eventLog]
-    .reverse()
-    .find((event) => event.type === 'assistant_transcript')?.data?.text;
+  const conversationMessages = eventLog.flatMap((event, index) => {
+    if (event.type === 'user_transcript') {
+      return [{
+        id: `legacy-user-${event.ts}-${index}`,
+        role: 'user',
+        text: event.data?.text || '',
+      }];
+    }
+    if (event.type === 'tool_exchange') {
+      return [{
+        id: `legacy-tools-${event.ts}-${index}`,
+        role: 'assistant',
+        text: '',
+        tool_calls: event.data?.tool_calls || [],
+      }];
+    }
+    if (event.type === 'assistant_transcript') {
+      return [{
+        id: `legacy-assistant-${event.ts}-${index}`,
+        role: 'assistant',
+        text: event.data?.text || '',
+      }];
+    }
+    return [];
+  });
 
   const activityCopy = {
     idle: ['Ready when you are', 'Start a call to begin the latency run.'],
@@ -680,7 +718,69 @@ export default function RealtimeVoicePanel({
         status={status}
       />
 
-      <section className="call-stage">
+      <section className="call-stage pipeline-call-stage">
+        <aside className="call-rail">
+          <div className="call-rail-topline">
+            <div className="call-rail-heading">
+              <span>Customer success</span>
+              <h1>Live call</h1>
+            </div>
+            <button
+              type="button"
+              className="demo-records-button"
+              onClick={() => setDemoDataOpen(true)}
+              aria-label="Open ten demo records"
+              title="Demo records"
+            >
+              <span aria-hidden="true">10</span>
+              <strong>Records</strong>
+            </button>
+          </div>
+
+          {controls}
+
+          <div className="speaker-orbs" aria-label="Call participants">
+            <div className={`speaker-orb-card you ${isUserSpeaking ? 'active' : ''}`}>
+              <div className="speaker-aura" aria-hidden="true"><i /><i /><span>Y</span></div>
+              <strong>You</strong>
+              <small>{isUserSpeaking ? 'Speaking' : 'Caller'}</small>
+            </div>
+            <div className={`speaker-orb-card mira ${isAgentSpeaking ? 'active' : ''}`}>
+              <div className="speaker-aura" aria-hidden="true"><i /><i /><span>M</span></div>
+              <strong>Mira</strong>
+              <small>{isAgentSpeaking ? 'Speaking' : 'Agent'}</small>
+            </div>
+          </div>
+
+          <div className="rail-activity" aria-live="polite">
+            <h2>{activityTitle}</h2>
+            <p>{activitySubtitle}</p>
+          </div>
+
+          <button
+            type="button"
+            onClick={callActive ? disconnect : connect}
+            className={`rail-call-button ${callActive ? 'hangup' : 'start'}`}
+            disabled={status === 'connecting'}
+            aria-label={callActive ? 'Disconnect call' : 'Start call with microphone'}
+            title={callActive ? 'Disconnect call' : 'Start call'}
+          >
+            <span aria-hidden="true">
+              {callActive ? (
+                <svg viewBox="0 0 24 24"><path d="M6.6 10.8c3.6-2.4 7.2-2.4 10.8 0l-1.6 3.1c-.2.4-.7.6-1.1.4l-2-1a1.7 1.7 0 0 0-1.4 0l-2 1c-.4.2-.9 0-1.1-.4l-1.6-3.1Z" /></svg>
+              ) : (
+                <svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 0 0 3.5-3.5V5a3.5 3.5 0 1 0-7 0v7a3.5 3.5 0 0 0 3.5 3.5Zm6-3.5a1 1 0 1 0-2 0 4 4 0 0 1-8 0 1 1 0 1 0-2 0 6 6 0 0 0 5 5.91V20H8.5a1 1 0 1 0 0 2h7a1 1 0 1 0 0-2H13v-2.09A6 6 0 0 0 18 12Z" /></svg>
+              )}
+            </span>
+          </button>
+        </aside>
+
+        <LiveConversationPanel messages={conversationMessages} status={status} />
+      </section>
+
+      <DemoDataPanel open={demoDataOpen} onClose={() => setDemoDataOpen(false)} />
+
+      <section className="call-stage" hidden aria-hidden="true">
         <div className="call-stage-header">
           <div>
             <div className="stage-eyebrow">Live customer success call</div>

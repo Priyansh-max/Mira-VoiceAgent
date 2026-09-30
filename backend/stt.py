@@ -31,69 +31,26 @@ _AUDIO_UPLOAD_TYPES = {
     "audio/webm": ("webm", "audio/webm"),
 }
 
+_DEFAULT_PROMPT = (
+    "Transcribe an English customer-success phone call for Mira. Preserve names in English "
+    "script. Write clearly spoken numbers, phone numbers, order IDs, and ticket IDs using "
+    "digits. Always output Latin characters only; transliterate any recognized names into "
+    "English script instead of native scripts. The caller is expected to speak English; for "
+    "short acknowledgements, callback confirmations, and support requests, prefer English "
+    "words over Hindi or Hinglish. Do not translate, summarize, or invent speech."
+)
+
 _FIELD_PROMPTS = {
-    "caller_name": "A caller is stating their name. Preserve the spoken name and use English script.",
-    "caller_phone": "A caller is stating phone digits. Format only spoken digits as numerals.",
-    "order_id": "A caller is stating an order ID made of digits. Format spoken digits as numerals.",
-    "ticket_id": "A caller is stating a ticket ID made of digits. Format spoken digits as numerals.",
-    "callback_time": "A caller is stating their preferred callback day and time.",
+    "caller_name": "The caller is stating their name. Output the name in Latin characters.",
+    "caller_phone": "The caller is stating phone digits. Format only spoken digits as numerals.",
+    "order_id": "The caller is stating an order ID made of digits. Format spoken digits as numerals.",
+    "ticket_id": "The caller is stating a ticket ID made of digits. Format spoken digits as numerals.",
+    "callback_time": "The caller is stating their preferred callback day and time.",
 }
 
-_DIGIT_WORDS = {
-    "zero": "0",
-    "oh": "0",
-    "one": "1",
-    "two": "2",
-    "three": "3",
-    "four": "4",
-    "five": "5",
-    "six": "6",
-    "seven": "7",
-    "eight": "8",
-    "nine": "9",
-    "زیرو": "0",
-    "صفر": "0",
-    "ون": "1",
-    "ایک": "1",
-    "ٹو": "2",
-    "دو": "2",
-    "تھری": "3",
-    "تین": "3",
-    "فور": "4",
-    "چار": "4",
-    "فائیو": "5",
-    "پانچ": "5",
-    "سکس": "6",
-    "چھ": "6",
-    "سیون": "7",
-    "سات": "7",
-    "ایٹ": "8",
-    "آٹھ": "8",
-    "نائن": "9",
-    "نو": "9",
-}
-_DIGIT_ALTERNATION = "|".join(
-    re.escape(word) for word in sorted(_DIGIT_WORDS, key=len, reverse=True)
-)
-_SPOKEN_DIGIT_SEQUENCE = re.compile(
-    rf"(?<!\w)(?:{_DIGIT_ALTERNATION})(?:[\s,.-]+(?:{_DIGIT_ALTERNATION}))+(?!\w)",
-    re.IGNORECASE,
-)
-_NON_ASCII_DIGITS = str.maketrans(
-    "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹०१२३४५६७८९",
-    "012345678901234567890123456789",
-)
-
-
-def normalize_spoken_identifiers(text: str) -> str:
-    """Normalize common spoken and non-ASCII digit sequences for IDs."""
-    normalized = text.translate(_NON_ASCII_DIGITS)
-
-    def replace_sequence(match: re.Match[str]) -> str:
-        words = re.findall(r"[^\W_]+", match.group(0), flags=re.UNICODE)
-        return "".join(_DIGIT_WORDS[word.casefold()] for word in words)
-
-    return _SPOKEN_DIGIT_SEQUENCE.sub(replace_sequence, normalized)
+def normalize_spoken_identifiers(text: str, *, expected_field: Optional[str] = None) -> str:
+    """Return provider text without rule-based word replacement."""
+    return text
 
 
 def wav_duration_seconds(audio_bytes: bytes, *, content_type: str) -> Optional[float]:
@@ -153,13 +110,15 @@ def transcribe(
 
     try:
         request = {
-            "model": os.environ.get("STT_MODEL", "gpt-4o-mini-transcribe"),
+            "model": os.environ.get("STT_MODEL", "gpt-4o-transcribe"),
             "file": (f"audio.{extension}", audio_bytes, media_type),
             "response_format": "json",
             "language": os.environ.get("STT_LANGUAGE", "en").strip() or "en",
         }
         configured_prompt = os.environ.get("STT_PROMPT", "").strip()
-        prompt = _FIELD_PROMPTS.get(expected_field or "") or configured_prompt
+        base_prompt = configured_prompt or _DEFAULT_PROMPT
+        field_prompt = _FIELD_PROMPTS.get(expected_field or "")
+        prompt = f"{base_prompt} {field_prompt}".strip()
         if prompt:
             request["prompt"] = prompt
 
@@ -167,7 +126,7 @@ def transcribe(
             **request,
         )
         raw_text = (r.text or "").strip()
-        return normalize_spoken_identifiers(raw_text) or None
+        return normalize_spoken_identifiers(raw_text, expected_field=expected_field) or None
     except Exception as exc:
         raise SpeechToTextError(f"STT request failed: {exc}") from exc
 

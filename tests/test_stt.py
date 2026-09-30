@@ -35,7 +35,10 @@ class SpeechToTextTest(unittest.TestCase):
         )
         self.assertEqual(transcriptions.kwargs["response_format"], "json")
         self.assertEqual(transcriptions.kwargs["language"], "en")
-        self.assertNotIn("prompt", transcriptions.kwargs)
+        self.assertIn("customer-success phone call", transcriptions.kwargs["prompt"])
+        self.assertIn("Latin characters only", transcriptions.kwargs["prompt"])
+        self.assertIn("prefer English", transcriptions.kwargs["prompt"])
+        self.assertNotIn("homework statements", transcriptions.kwargs["prompt"])
 
     def test_uses_a_narrow_prompt_while_capturing_an_order_id(self) -> None:
         transcriptions = _FakeTranscriptions(text="one two three four")
@@ -48,7 +51,7 @@ class SpeechToTextTest(unittest.TestCase):
                 expected_field="order_id",
             )
 
-        self.assertEqual(text, "1234")
+        self.assertEqual(text, "one two three four")
         self.assertIn("order ID made of digits", transcriptions.kwargs["prompt"])
 
     def test_allows_an_explicit_language_override(self) -> None:
@@ -83,18 +86,14 @@ class SpeechToTextTest(unittest.TestCase):
             with self.assertRaisesRegex(stt.SpeechToTextError, "provider rejected audio"):
                 stt.transcribe(b"broken", content_type="audio/webm")
 
-    def test_normalizes_spoken_english_digits_for_identifiers(self) -> None:
+    def test_does_not_rewrite_provider_transcript_with_digit_rules(self) -> None:
         transcriptions = _FakeTranscriptions(text="My order ID is one two three four")
         client = SimpleNamespace(audio=SimpleNamespace(transcriptions=transcriptions))
 
         with patch("backend.stt._client", return_value=client):
             text = stt.transcribe(b"wav-bytes", content_type="audio/wav")
 
-        self.assertEqual(text, "My order ID is 1234")
-
-    def test_normalizes_urdu_digit_words_and_non_ascii_digits(self) -> None:
-        self.assertEqual(stt.normalize_spoken_identifiers("ون ٹو تھری فور"), "1234")
-        self.assertEqual(stt.normalize_spoken_identifiers("۱۲۳۴"), "1234")
+        self.assertEqual(text, "My order ID is one two three four")
 
     def test_rejects_an_impossible_transcript_for_short_audio(self) -> None:
         transcript = " ".join(["customer"] * 40)

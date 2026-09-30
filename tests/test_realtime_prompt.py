@@ -20,6 +20,7 @@ class RealtimePromptTest(unittest.TestCase):
         self.assertIn("directive.require_repeat_verbatim", REALTIME_AGENT_PROMPT)
         self.assertIn("speak exactly `directive.response_text`", REALTIME_AGENT_PROMPT)
         self.assertIn("Never repeat a normal request for information", REALTIME_AGENT_PROMPT)
+        self.assertIn("one digit at a time", REALTIME_AGENT_PROMPT)
         self.assertIn("Missing, truncated, empty, or unclear transcription is not a refusal", REALTIME_AGENT_PROMPT)
         self.assertIn("call `support_callback` immediately", REALTIME_AGENT_PROMPT)
         self.assertIn("`order_status`, `ticket_status`, or `customer_support`", REALTIME_AGENT_PROMPT)

@@ -1,22 +1,37 @@
 const API = import.meta.env.VITE_BACKEND_URL
 
-export async function createSession() {
-  const res = await fetch(`${API}/sessions`, { method: 'POST' });
+export async function createPipelineSession() {
+  const res = await fetch(`${API}/pipeline/session`, { method: 'POST' });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
-export async function checkHealth() {
-  const res = await fetch(`${API}/health`);
+export async function deleteSession(sessionId) {
+  if (!sessionId) return { session_id: '', deleted: false };
+  const res = await fetch(`${API}/session/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+    keepalive: true,
+  });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
-export async function chat(sessionId, text) {
-  const res = await fetch(`${API}/chat`, {
+export async function runPipelineTurn(sessionId, turnId, audioBlob) {
+  const form = new FormData();
+  const mediaType = (audioBlob.type || 'audio/webm').split(';', 1)[0];
+  const extension = {
+    'audio/mp4': 'mp4',
+    'audio/ogg': 'ogg',
+    'audio/wav': 'wav',
+    'audio/mpeg': 'mp3',
+    'audio/webm': 'webm',
+  }[mediaType] || 'webm';
+  form.append('session_id', sessionId);
+  form.append('turn_id', turnId);
+  form.append('audio', audioBlob, `turn.${extension}`);
+  const res = await fetch(`${API}/pipeline/turn`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session_id: sessionId, text }),
+    body: form,
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
@@ -42,47 +57,30 @@ export async function executeRealtimeTool(sessionId, toolName, toolArgs = {}) {
   return res.json();
 }
 
-export async function sttAvailable() {
-  const res = await fetch(`${API}/stt/available`);
-  if (!res.ok) return { available: false };
-  return res.json();
-}
-
-export async function transcribeAudio(blob) {
-  const form = new FormData();
-  form.append('audio', blob, 'audio.webm');
-  const res = await fetch(`${API}/stt`, { method: 'POST', body: form });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
-}
-
-export async function ttsAvailable() {
-  const res = await fetch(`${API}/tts/available`);
-  if (!res.ok) return { available: false };
-  return res.json();
-}
-
-export async function synthesizeSpeech(text) {
-  const res = await fetch(`${API}/tts`, {
+export async function recordLatencyTurn(sample) {
+  const res = await fetch(`${API}/latency/turn`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(sample),
   });
   if (!res.ok) throw new Error(await res.text());
-  return res.blob();
+  return res.json();
 }
 
-export function traceEventSource(sessionId, onEvent, onError) {
-  const es = new EventSource(`${API}/trace/${sessionId}`);
-  es.onmessage = (e) => {
-    try {
-      const data = JSON.parse(e.data);
-      onEvent(data);
-    } catch (_) {}
-  };
-  es.onerror = () => {
-    onError?.(new Error(`Trace stream failed for session ${sessionId}`));
-    es.close();
-  };
-  return () => es.close();
+export async function getLatencySummary() {
+  const res = await fetch(`${API}/latency/summary`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function downloadLatencyCsv() {
+  const res = await fetch(`${API}/latency/export.csv`);
+  if (!res.ok) throw new Error(await res.text());
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = 'latency_samples.csv';
+  anchor.click();
+  URL.revokeObjectURL(url);
 }

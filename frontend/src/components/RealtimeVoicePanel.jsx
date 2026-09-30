@@ -1,7 +1,65 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { createRealtimeSession, executeRealtimeTool } from '../api';
+import {
+  createRealtimeSession,
+  deleteSession,
+  executeRealtimeTool,
+  getLatencySummary,
+  recordLatencyTurn,
+} from '../api';
+import LatencyPanel from './LatencyPanel';
 
 const OPENAI_REALTIME_URL = 'https://api.openai.com/v1/realtime/calls';
+const AUDIO_RMS_THRESHOLD = 0.018;
+
+const AUDIO_DELTA_EVENTS = new Set(['response.output_audio.delta', 'response.audio.delta']);
+const AUDIO_DONE_EVENTS = new Set(['response.output_audio.done', 'response.audio.done']);
+const AUDIO_TRANSCRIPT_DELTA_EVENTS = new Set([
+  'response.output_audio_transcript.delta',
+  'response.audio_transcript.delta',
+]);
+const AUDIO_TRANSCRIPT_DONE_EVENTS = new Set([
+  'response.output_audio_transcript.done',
+  'response.audio_transcript.done',
+]);
+
+function createEnergyMonitor(stream, onEnergy) {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return () => {};
+
+  const context = new AudioContextClass();
+  const source = context.createMediaStreamSource(stream);
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 512;
+  source.connect(analyser);
+  const samples = new Float32Array(analyser.fftSize);
+  let frameId;
+
+  const sample = () => {
+    analyser.getFloatTimeDomainData(samples);
+    let sumSquares = 0;
+    for (const value of samples) sumSquares += value * value;
+    onEnergy(Math.sqrt(sumSquares / samples.length), performance.now());
+    frameId = requestAnimationFrame(sample);
+  };
+  void context.resume();
+  frameId = requestAnimationFrame(sample);
+
+  return () => {
+    cancelAnimationFrame(frameId);
+    source.disconnect();
+    analyser.disconnect();
+    void context.close();
+  };
+}
+
+function responseHasFunctionCall(event) {
+  return Boolean(event?.response?.output?.some((item) => item?.type === 'function_call'));
+}
+
+function duration(start, end) {
+  if (start == null || end == null) return null;
+  return Math.max(0, Math.round((end - start) * 10) / 10);
+}
 
 function summarizeRealtimeEvent(event) {
   const type = event?.type || 'unknown';
@@ -54,7 +112,7 @@ function summarizeRealtimeEvent(event) {
     };
   }
 
-  if (type === 'response.audio_transcript.done' || type === 'response.output_text.done') {
+  if (AUDIO_TRANSCRIPT_DONE_EVENTS.has(type) || type === 'response.output_text.done') {
     return {
       type: 'assistant_transcript',
       message: 'Assistant response transcript',
@@ -110,16 +168,17 @@ function extractFunctionCall(event) {
 export default function RealtimeVoicePanel({
   sessionId,
   resetToken = 0,
-  tracePanel = null,
   onSessionChange,
-  onTraceEvent,
   onError,
+  controls,
 }) {
   const [status, setStatus] = useState('idle');
   const [realtimeMeta, setRealtimeMeta] = useState(null);
   const [eventLog, setEventLog] = useState([]);
   const [isUserSpeaking, setIsUserSpeaking] = useState(false);
   const [isAgentSpeaking, setIsAgentSpeaking] = useState(false);
+  const [latencySummary, setLatencySummary] = useState(null);
+  const [latencyTurns, setLatencyTurns] = useState([]);
 
   const pcRef = useRef(null);
   const dcRef = useRef(null);
@@ -127,7 +186,51 @@ export default function RealtimeVoicePanel({
   const audioRef = useRef(null);
   const handledCallsRef = useRef(new Set());
   const connectAttemptRef = useRef(0);
+  const sessionIdRef = useRef('');
+  const cleanupPromiseRef = useRef(Promise.resolve());
   const mountedRef = useRef(true);
+  const inputMonitorCleanupRef = useRef(null);
+  const outputMonitorCleanupRef = useRef(null);
+  const inputLastVoiceAtRef = useRef(null);
+  const activeTurnRef = useRef(null);
+
+  const refreshLatencySummary = useCallback(async () => {
+    try {
+      const nextSummary = await getLatencySummary();
+      if (mountedRef.current) setLatencySummary(nextSummary);
+    } catch (_) {
+      // Metrics should never interrupt the voice conversation.
+    }
+  }, []);
+
+  const completeTurn = useCallback((appSessionId) => {
+    const turn = activeTurnRef.current;
+    if (!turn || turn.submitted || !turn.finalResponseDoneAt || !turn.firstAudioAt) return;
+
+    turn.submitted = true;
+    const heardAt = turn.playbackStartedAt || turn.firstAudioAt;
+    const sample = {
+      turn_id: turn.turnId,
+      session_id: appSessionId,
+      response_mode: turn.responseMode,
+      has_tool_call: turn.hasToolCall,
+      transcript: turn.transcript || null,
+      measurement_source: turn.playbackStartedAt ? 'output_energy' : 'first_audio_event',
+      end_of_speech_detection_ms: duration(turn.localSpeechEndAt, turn.turnDetectedAt) || 0,
+      stt_ms: duration(turn.turnDetectedAt, turn.transcriptCompletedAt),
+      llm_ttft_ms: duration(turn.turnDetectedAt, turn.firstModelTokenAt),
+      llm_total_ms: duration(turn.turnDetectedAt, turn.initialResponseDoneAt),
+      tts_ttf_audio_ms: duration(turn.finalResponseCreatedAt, turn.firstAudioAt),
+      total_to_first_audio_ms: duration(turn.localSpeechEndAt, heardAt) || 0,
+      tool_round_trip_ms: duration(turn.toolStartedAt, turn.toolCompletedAt),
+    };
+
+    setLatencyTurns((previous) => [sample, ...previous].slice(0, 12));
+
+    void recordLatencyTurn(sample)
+      .then(refreshLatencySummary)
+      .catch((error) => onError?.(`Latency sample was not saved: ${error.message}`));
+  }, [onError, refreshLatencySummary]);
 
   const pushEvent = useCallback((appSessionId, event) => {
     const traceEvent = {
@@ -137,11 +240,25 @@ export default function RealtimeVoicePanel({
     };
 
     setEventLog((prev) => [...prev.slice(-19), traceEvent]);
-    onTraceEvent?.(traceEvent);
-  }, [onTraceEvent]);
+  }, []);
+
+  const cleanupBackendSession = useCallback((staleSessionId) => {
+    if (!staleSessionId) return cleanupPromiseRef.current;
+    cleanupPromiseRef.current = cleanupPromiseRef.current
+      .catch(() => undefined)
+      .then(() => deleteSession(staleSessionId))
+      .catch((error) => {
+        if (mountedRef.current) {
+          onError?.(`Call ended locally, but backend cleanup failed: ${error.message}`);
+        }
+      });
+    return cleanupPromiseRef.current;
+  }, [onError]);
 
   const disconnect = useCallback(() => {
     connectAttemptRef.current += 1;
+    const staleSessionId = sessionIdRef.current;
+    sessionIdRef.current = '';
     dcRef.current?.close();
     dcRef.current = null;
 
@@ -152,15 +269,27 @@ export default function RealtimeVoicePanel({
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
 
+    inputMonitorCleanupRef.current?.();
+    inputMonitorCleanupRef.current = null;
+    outputMonitorCleanupRef.current?.();
+    outputMonitorCleanupRef.current = null;
+    inputLastVoiceAtRef.current = null;
+    activeTurnRef.current = null;
+
     if (audioRef.current) {
       audioRef.current.srcObject = null;
     }
 
+    void cleanupBackendSession(staleSessionId);
+    onSessionChange?.('');
     handledCallsRef.current = new Set();
+    setEventLog([]);
+    setRealtimeMeta(null);
+    setLatencyTurns([]);
     setIsUserSpeaking(false);
     setIsAgentSpeaking(false);
     setStatus('idle');
-  }, []);
+  }, [cleanupBackendSession, onSessionChange]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -173,11 +302,11 @@ export default function RealtimeVoicePanel({
   useEffect(() => {
     if (resetToken === 0) return;
     disconnect();
-    setEventLog([]);
-    setRealtimeMeta(null);
-    setIsUserSpeaking(false);
-    setIsAgentSpeaking(false);
   }, [disconnect, resetToken]);
+
+  useEffect(() => {
+    void refreshLatencySummary();
+  }, [refreshLatencySummary]);
 
   const sendRealtimeEvent = useCallback((event) => {
     if (!dcRef.current || dcRef.current.readyState !== 'open') {
@@ -190,18 +319,81 @@ export default function RealtimeVoicePanel({
     const { callId, name, arguments: toolArgs } = functionCall;
 
     try {
-      const toolResponse = await executeRealtimeTool(appSessionId, name, toolArgs);
+      if (activeTurnRef.current) {
+        activeTurnRef.current.hasToolCall = true;
+        activeTurnRef.current.toolStartedAt = performance.now();
+      }
+      let toolResponse = await executeRealtimeTool(appSessionId, name, toolArgs);
+      const chainedCalls = new Set();
+      while (['ready_for_lookup', 'route_to_callback', 'route_to_identity'].includes(toolResponse.action)) {
+        const nextTool = toolResponse.action === 'ready_for_lookup'
+          ? 'customer_lookup'
+          : toolResponse.action === 'route_to_identity'
+            ? 'customer_identity'
+            : 'support_callback';
+        const chainKey = `${nextTool}:${toolResponse.purpose}`;
+        if (chainedCalls.has(chainKey)) throw new Error('Tool continuation loop detected');
+        chainedCalls.add(chainKey);
+        toolResponse = await executeRealtimeTool(appSessionId, nextTool, {
+          purpose: toolResponse.purpose,
+          caller_name: toolResponse.caller_name || null,
+          caller_phone: toolResponse.caller_phone || null,
+          order_id: toolResponse.order_id || null,
+          ticket_id: toolResponse.ticket_id || null,
+          callback_time: toolResponse.callback_time || null,
+          attempt: toolResponse.attempt,
+        });
+      }
+      if (!mountedRef.current || sessionIdRef.current !== appSessionId) return;
+      if (activeTurnRef.current) {
+        activeTurnRef.current.toolCompletedAt = performance.now();
+        activeTurnRef.current.responseMode = toolResponse.response_mode;
+      }
+
+      const modelToolResponse = toolResponse.response_mode === 'speech_directive'
+        ? toolResponse
+        : {
+            purpose: toolResponse.purpose,
+            action: toolResponse.action,
+            caller_name: toolResponse.caller_name,
+            caller_phone: toolResponse.caller_phone,
+            order_id: toolResponse.order_id,
+            ticket_id: toolResponse.ticket_id,
+            callback_time: toolResponse.callback_time,
+            attempt: toolResponse.attempt,
+            information: toolResponse.information,
+            session_state: toolResponse.session_state,
+            response_mode: toolResponse.response_mode,
+            backend_tool_ms: toolResponse.backend_tool_ms,
+          };
 
       sendRealtimeEvent({
         type: 'conversation.item.create',
         item: {
           type: 'function_call_output',
           call_id: callId,
-          output: JSON.stringify(toolResponse),
+          output: JSON.stringify(modelToolResponse),
         },
       });
-      sendRealtimeEvent({ type: 'response.create' });
+      if (activeTurnRef.current) activeTurnRef.current.awaitingPostToolResponse = true;
+      if (toolResponse.response_mode === 'speech_directive') {
+        if (!toolResponse.directive?.response_text) {
+          throw new Error(`Terminal tool action ${toolResponse.action} did not return a speech directive`);
+        }
+        sendRealtimeEvent({
+          type: 'response.create',
+          response: {
+            input: [],
+            output_modalities: ['audio'],
+            tool_choice: 'none',
+            instructions: `Say exactly the following, with no additions or omissions:\n${toolResponse.directive.response_text}`,
+          },
+        });
+      } else {
+        sendRealtimeEvent({ type: 'response.create' });
+      }
     } catch (error) {
+      if (!mountedRef.current || sessionIdRef.current !== appSessionId) return;
       sendRealtimeEvent({
         type: 'conversation.item.create',
         item: {
@@ -231,13 +423,18 @@ export default function RealtimeVoicePanel({
     onError?.(null);
     setStatus('connecting');
     setEventLog([]);
+    setLatencyTurns([]);
 
     try {
+      await cleanupPromiseRef.current;
+      if (!mountedRef.current || connectAttemptRef.current !== attemptId) return;
       const realtime = await createRealtimeSession();
       if (!mountedRef.current || connectAttemptRef.current !== attemptId) {
+        void cleanupBackendSession(realtime.app_session_id);
         return;
       }
       const appSessionId = realtime.app_session_id;
+      sessionIdRef.current = appSessionId;
       onSessionChange?.(appSessionId);
       setRealtimeMeta(realtime);
 
@@ -254,9 +451,20 @@ export default function RealtimeVoicePanel({
       };
 
       pc.ontrack = (event) => {
+        const remoteStream = event.streams[0];
+        if (!remoteStream) return;
         if (audioRef.current) {
-          audioRef.current.srcObject = event.streams[0];
+          audioRef.current.srcObject = remoteStream;
         }
+        outputMonitorCleanupRef.current?.();
+        outputMonitorCleanupRef.current = createEnergyMonitor(remoteStream, (rms, now) => {
+          const turn = activeTurnRef.current;
+          if (rms >= AUDIO_RMS_THRESHOLD && turn?.turnDetectedAt && !turn.playbackStartedAt) {
+            turn.playbackStartedAt = now;
+            if (!turn.firstAudioAt) turn.firstAudioAt = now;
+            completeTurn(appSessionId);
+          }
+        });
       };
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -270,6 +478,10 @@ export default function RealtimeVoicePanel({
       }
       streamRef.current = stream;
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+      inputMonitorCleanupRef.current?.();
+      inputMonitorCleanupRef.current = createEnergyMonitor(stream, (rms, now) => {
+        if (rms >= AUDIO_RMS_THRESHOLD) inputLastVoiceAtRef.current = now;
+      });
 
       const dc = pc.createDataChannel('oai-events');
       dcRef.current = dc;
@@ -281,26 +493,83 @@ export default function RealtimeVoicePanel({
       dc.addEventListener('message', (e) => {
         try {
           const event = JSON.parse(e.data);
+          const now = performance.now();
           if (event?.type === 'input_audio_buffer.speech_started') {
             setIsUserSpeaking(true);
+            inputLastVoiceAtRef.current = now;
+            activeTurnRef.current = {
+              turnId: crypto.randomUUID(),
+              responseMode: realtime.response_mode || 'llm',
+              speechStartedAt: now,
+              localSpeechEndAt: null,
+              turnDetectedAt: null,
+              transcriptCompletedAt: null,
+              firstModelTokenAt: null,
+              initialResponseDoneAt: null,
+              finalResponseCreatedAt: null,
+              finalResponseDoneAt: null,
+              firstAudioAt: null,
+              playbackStartedAt: null,
+              hasToolCall: false,
+              submitted: false,
+            };
+          }
+          if (event?.type === 'input_audio_buffer.speech_stopped') {
+            setIsUserSpeaking(false);
+            if (activeTurnRef.current) {
+              activeTurnRef.current.localSpeechEndAt = inputLastVoiceAtRef.current || now;
+              activeTurnRef.current.turnDetectedAt = now;
+            }
+          }
+          if (event?.type === 'conversation.item.input_audio_transcription.completed') {
+            setIsUserSpeaking(false);
+            if (activeTurnRef.current) {
+              activeTurnRef.current.transcript = event.transcript || '';
+              activeTurnRef.current.transcriptCompletedAt = now;
+            }
           }
           if (
-            event?.type === 'input_audio_buffer.speech_stopped'
-            || event?.type === 'conversation.item.input_audio_transcription.completed'
+            event?.type === 'response.function_call_arguments.delta'
+            || event?.type === 'response.function_call_arguments.done'
+            || AUDIO_TRANSCRIPT_DELTA_EVENTS.has(event?.type)
+            || event?.type === 'response.output_text.delta'
           ) {
-            setIsUserSpeaking(false);
+            if (activeTurnRef.current && !activeTurnRef.current.firstModelTokenAt) {
+              activeTurnRef.current.firstModelTokenAt = now;
+            }
           }
-          if (event?.type === 'response.audio.delta' || event?.type === 'response.created') {
+          if (event?.type === 'response.created' && activeTurnRef.current) {
+            if (!activeTurnRef.current.initialResponseCreatedAt) {
+              activeTurnRef.current.initialResponseCreatedAt = now;
+              activeTurnRef.current.finalResponseCreatedAt = now;
+            } else if (activeTurnRef.current.awaitingPostToolResponse) {
+              activeTurnRef.current.finalResponseCreatedAt = now;
+              activeTurnRef.current.awaitingPostToolResponse = false;
+            }
+          }
+          if (AUDIO_DELTA_EVENTS.has(event?.type) && activeTurnRef.current && !activeTurnRef.current.firstAudioAt) {
+            activeTurnRef.current.firstAudioAt = now;
+          }
+          if (AUDIO_DELTA_EVENTS.has(event?.type) || event?.type === 'response.created') {
             setIsAgentSpeaking(true);
           }
           if (
-            event?.type === 'response.audio.done'
-            || event?.type === 'response.audio_transcript.done'
+            AUDIO_DONE_EVENTS.has(event?.type)
+            || AUDIO_TRANSCRIPT_DONE_EVENTS.has(event?.type)
             || event?.type === 'response.output_text.done'
             || event?.type === 'response.done'
             || event?.type === 'error'
           ) {
             setIsAgentSpeaking(false);
+          }
+          if (event?.type === 'response.done' && activeTurnRef.current) {
+            if (!activeTurnRef.current.initialResponseDoneAt) {
+              activeTurnRef.current.initialResponseDoneAt = now;
+            }
+            if (!responseHasFunctionCall(event)) {
+              activeTurnRef.current.finalResponseDoneAt = now;
+              completeTurn(appSessionId);
+            }
           }
           pushEvent(appSessionId, event);
           const functionCall = extractFunctionCall(event);
@@ -367,106 +636,147 @@ export default function RealtimeVoicePanel({
       setStatus('error');
       onError?.(error.message || 'Realtime connection failed');
     }
-  }, [disconnect, handleFunctionCall, onError, onSessionChange, pushEvent]);
+  }, [cleanupBackendSession, completeTurn, disconnect, handleFunctionCall, onError, onSessionChange, pushEvent]);
+
+  const callActive = status === 'connected' || status === 'connecting';
+  const activityState = isUserSpeaking
+    ? 'listening'
+    : isAgentSpeaking
+      ? 'speaking'
+      : status === 'connected'
+        ? 'ready'
+        : status;
+  const latestUserTranscript = [...eventLog]
+    .reverse()
+    .find((event) => event.type === 'user_transcript')?.data?.text;
+  const latestAgentTranscript = [...eventLog]
+    .reverse()
+    .find((event) => event.type === 'assistant_transcript')?.data?.text;
+
+  const activityCopy = {
+    idle: ['Ready when you are', 'Start a call to begin the latency run.'],
+    connecting: ['Opening the channel', 'Securing a low-latency WebRTC connection…'],
+    ready: ['Mira is listening', 'Speak naturally. You can interrupt at any time.'],
+    listening: ['Listening to you', 'Detecting the end of your turn in realtime.'],
+    speaking: ['Mira is responding', 'Audio is streaming back as it is generated.'],
+    error: ['Connection interrupted', 'Start a new call when you are ready.'],
+  };
+  const [activityTitle, activitySubtitle] = activityCopy[activityState] || activityCopy.idle;
 
   return (
-    <div className="grid h-full min-h-0 gap-5 lg:grid-cols-[minmax(0,1.25fr)_minmax(320px,0.88fr)]">
+    <div className="voice-experience">
       <audio ref={audioRef} autoPlay />
 
-      <section className="flex min-h-0 min-w-0 flex-col rounded-[28px] border border-white/60 bg-white/38 p-4 shadow-[0_18px_44px_rgba(44,62,68,0.08)] backdrop-blur-2xl sm:p-5">
-        <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
+      <LatencyPanel
+        turns={latencyTurns}
+        summary={latencySummary}
+        activeMode={realtimeMeta?.response_mode || 'llm'}
+        status={status}
+      />
+
+      <section className="call-stage">
+        <div className="call-stage-header">
           <div>
-            <div className="text-sm font-semibold text-slate-700">Live voice console</div>
-            {realtimeMeta && (
-              <div className="mt-2 text-xs text-slate-400">
-                Model: {realtimeMeta.realtime_session?.model || 'unknown'} • Voice: {realtimeMeta.realtime_session?.audio?.output?.voice || 'unknown'}
-              </div>
-            )}
+            <div className="stage-eyebrow">Live customer success call</div>
+            <h1>Talk with Mira</h1>
           </div>
-          <div className="rounded-full border border-white/70 bg-white/55 px-4 py-2 text-xs font-medium tracking-[0.02em] text-slate-500 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)] backdrop-blur-xl">
-            {sessionId ? `Session ${sessionId.slice(0, 8)}...` : 'Preparing session'}
-          </div>
-        </div>
-
-        <div className="mb-5 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3">
-          <div className="relative overflow-hidden rounded-[24px] border border-white/70 bg-white/50 px-4 py-5 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]">
-            {isUserSpeaking && <div className="speaker-wave speaker-wave-user" />}
-            <div className="relative mx-auto mb-3 flex h-20 w-20 items-center justify-center rounded-full bg-gradient-to-b from-[#f3d8cf] to-[#dbab95] text-sm font-semibold text-[#5f3f35] shadow-[0_12px_24px_rgba(95,63,53,0.12)]">
-              Caller
-            </div>
-            <div className="relative text-base font-semibold text-slate-900">Customer</div>
-            <div className="relative mt-1 text-sm text-slate-500">
-              {isUserSpeaking ? 'Speaking now' : 'Human side'}
-            </div>
-          </div>
-
-          <div className="flex justify-center">
-            <div className="rounded-full border border-white/70 bg-[rgba(255,255,255,0.46)] px-4 py-2 text-[13px] font-medium text-slate-700 shadow-[0_10px_22px_rgba(15,23,42,0.08)] backdrop-blur-xl">
-              Live
-            </div>
-          </div>
-
-          <div className="relative overflow-hidden rounded-[24px] border border-white/70 bg-white/50 px-4 py-5 text-center shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]">
-            {isAgentSpeaking && <div className="speaker-wave speaker-wave-agent" />}
-            <div className="relative mx-auto mb-3 flex h-20 w-20 items-center justify-center rounded-full bg-[radial-gradient(circle_at_35%_35%,#b5eff1_0%,#79bfd3_42%,#5f87c7_100%)] text-sm font-semibold text-white shadow-[0_12px_24px_rgba(95,135,199,0.18)]">
-              AI
-            </div>
-            <div className="relative text-base font-semibold text-slate-900">Mira</div>
-            <div className="relative mt-1 text-sm text-slate-500">
-              {isAgentSpeaking ? 'Responding now' : 'Voice agent'}
-            </div>
+          <div className="session-cluster">
+            {controls}
+            <span className={`connection-pill ${status}`}>
+              <span className="connection-dot" />
+              {status === 'connected' ? 'Live' : status}
+            </span>
+            <span className="session-id">
+              {sessionId ? `Session ${sessionId.slice(0, 8)}` : 'No active session'}
+            </span>
           </div>
         </div>
 
-        <div className="flex min-h-0 flex-1 flex-col rounded-[24px] border border-white/70 bg-[linear-gradient(180deg,rgba(251,253,253,0.72),rgba(243,248,248,0.56))] p-4 shadow-[0_16px_36px_rgba(44,62,68,0.08)]">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-4">
-            <div>
-              <div className="text-base font-semibold text-slate-900">Realtime Voice</div>
-              <div className="mt-1 text-sm text-slate-500">
-                Status:
-                <span className="ml-2 inline-flex rounded-full bg-slate-900/6 px-2.5 py-1 text-xs font-medium capitalize text-slate-700">
-                  {status === 'connected' ? 'Live' : status}
-                </span>
-                {sessionId ? ` • app session ${sessionId.slice(0, 8)}…` : ''}
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={status === 'connected' || status === 'connecting' ? disconnect : connect}
-              className={`rounded-full px-4 py-2.5 text-sm font-medium shadow-[0_10px_22px_rgba(15,23,42,0.08)] backdrop-blur-xl transition ${
-                status === 'connected' || status === 'connecting'
-                  ? 'border border-white/60 bg-white/70 text-slate-700 hover:bg-white'
-                  : 'bg-slate-900/88 text-white hover:bg-slate-900'
-              }`}
-            >
-              {status === 'connected' || status === 'connecting' ? 'Disconnect Call' : 'Make call'}
-            </button>
+        <div className="call-center">
+          <div className="participant-label caller-label">
+            <span className={`participant-signal ${isUserSpeaking ? 'active' : ''}`} />
+            <span>
+              <strong>You</strong>
+              <small>{isUserSpeaking ? 'Speaking' : 'Caller'}</small>
+            </span>
           </div>
 
-          <div className="hide-scrollbar min-h-0 flex-1 overflow-y-auto rounded-[20px] border border-white/65 bg-white/42 px-4 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.65)]">
-            {eventLog.length === 0 ? (
-              <div className="text-sm text-slate-400">Realtime events will appear here after you connect and speak.</div>
+          <div className={`orb-system ${activityState}`}>
+            <div className="orb-ring orb-ring-one" />
+            <div className="orb-ring orb-ring-two" />
+            <div className="orb-ring orb-ring-three" />
+            <div className="orb-track">
+              <span className="orb-satellite" />
+            </div>
+            <div className="call-orb">
+              <div className="orb-glow" />
+              <div className="voice-bars" aria-hidden="true">
+                {[0, 1, 2, 3, 4].map((bar) => <span key={bar} />)}
+              </div>
+              <span className="orb-monogram">M</span>
+            </div>
+          </div>
+
+          <div className="participant-label mira-label">
+            <span className={`participant-signal mira ${isAgentSpeaking ? 'active' : ''}`} />
+            <span>
+              <strong>Mira</strong>
+              <small>{isAgentSpeaking ? 'Speaking' : 'AI agent'}</small>
+            </span>
+          </div>
+        </div>
+
+        <div className="call-state-copy" aria-live="polite">
+          <h2>{activityTitle}</h2>
+          <p>{activitySubtitle}</p>
+        </div>
+
+        <button
+          type="button"
+          onClick={callActive ? disconnect : connect}
+          className={`call-control ${callActive ? 'hangup' : 'start'}`}
+          disabled={status === 'connecting'}
+        >
+          <span className="call-control-icon" aria-hidden="true">
+            {callActive ? (
+              <svg viewBox="0 0 24 24"><path d="M6.6 10.8c3.6-2.4 7.2-2.4 10.8 0l-1.6 3.1c-.2.4-.7.6-1.1.4l-2-1a1.7 1.7 0 0 0-1.4 0l-2 1c-.4.2-.9 0-1.1-.4l-1.6-3.1Z" /></svg>
             ) : (
-              eventLog.map((event, idx) => (
-                <div key={`${event.ts}-${idx}`} className="mb-2 last:mb-0 text-sm text-slate-500">
-                  <span className="font-medium text-[#2b7a78]">{event.message}</span>
-                  {event.data?.text && <span className="text-slate-700"> — {event.data.text}</span>}
-                </div>
-              ))
+              <svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 0 0 3.5-3.5V5a3.5 3.5 0 1 0-7 0v7a3.5 3.5 0 0 0 3.5 3.5Zm6-3.5a1 1 0 1 0-2 0 4 4 0 0 1-8 0 1 1 0 1 0-2 0 6 6 0 0 0 5 5.91V20H8.5a1 1 0 1 0 0 2h7a1 1 0 1 0 0-2H13v-2.09A6 6 0 0 0 18 12Z" /></svg>
             )}
-          </div>
-        </div>
-      </section>
+          </span>
+          <span>
+            <strong>{status === 'connecting' ? 'Connecting…' : callActive ? 'End call' : 'Start live call'}</strong>
+            <small>{callActive ? 'Close the realtime session' : 'Microphone access required'}</small>
+          </span>
+        </button>
 
-      <section className="flex min-h-0 min-w-0 flex-col rounded-[28px] border border-white/60 bg-white/38 p-4 shadow-[0_18px_44px_rgba(44,62,68,0.08)] backdrop-blur-2xl sm:p-5">
-        <div className="mb-4">
-          <div className="text-sm font-semibold text-slate-700">Live trace</div>
-          <div className="mt-1 text-sm text-slate-500">
-            Watch transcripts, tool calls, and policy decisions without expanding the whole console.
+        <div className="conversation-glance">
+          <div className="glance-card caller">
+            <span className="glance-label">Latest from you</span>
+            <p>{latestUserTranscript || 'Your transcript will appear here while you speak.'}</p>
+          </div>
+          <div className="conversation-flow" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </div>
+          <div className="glance-card agent">
+            <span className="glance-label">Latest from Mira</span>
+            <p>{latestAgentTranscript || 'Mira’s streamed response will appear here.'}</p>
           </div>
         </div>
-        <div className="min-h-0 flex-1">
-          {tracePanel}
+
+        <div className="call-footer">
+          <span><i className="footer-dot blue" /> Server VAD</span>
+          <span><i className="footer-dot cyan" /> Streaming model</span>
+          <span><i className="footer-dot violet" /> Live audio</span>
+          {realtimeMeta && (
+            <span className="model-label">
+              {realtimeMeta.realtime_session?.model || 'Realtime model'}
+              {' · '}
+              {realtimeMeta.realtime_session?.audio?.output?.voice || 'voice'}
+            </span>
+          )}
         </div>
       </section>
     </div>

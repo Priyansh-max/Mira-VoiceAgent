@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import date as real_date
 import unittest
+from unittest.mock import patch
 
 from backend.conversation import SessionState
 from backend.realtime_tools import RealtimeToolRouter
@@ -118,6 +120,8 @@ class RealtimeToolRouterTest(unittest.TestCase):
         self.assertEqual(result["purpose"], "order_status")
         self.assertEqual(result["action"], "return_order_status")
         self.assertEqual(result["information"], {"order_id": "1234", "status": "Shipped today"})
+        self.assertIn("1, 2, 3, 4", result["directive"]["response_text"])
+        self.assertNotIn("one thousand", result["directive"]["response_text"].lower())
 
     def test_missing_order_id_gets_one_recognition_repair_then_escalates(self) -> None:
         self.call("customer_identity", name="John Carper")
@@ -160,7 +164,8 @@ class RealtimeToolRouterTest(unittest.TestCase):
         result = self.call("customer_lookup", order_id="999999", attempt=1)
 
         self.assertEqual(result["action"], "route_to_callback")
-        self.assertIn("999999", result["directive"]["response_text"])
+        self.assertEqual(result["information"]["order_id"], "999999")
+        self.assertIn("9, 9, 9, 9, 9, 9", result["directive"]["response_text"])
 
     def test_callback_asks_for_time_before_scheduling(self) -> None:
         first = self.call("support_callback", purpose="ticket_status", attempt=1)
@@ -172,15 +177,34 @@ class RealtimeToolRouterTest(unittest.TestCase):
             "support_callback.ticket_status.no_callback_time",
         )
 
-        scheduled = self.call(
-            "support_callback",
-            purpose="ticket_status",
-            callback_time="tomorrow at 3 PM",
-            attempt=1,
-        )
+        with patch("backend.realtime_tools.date") as mocked_date:
+            mocked_date.today.return_value = real_date(2026, 9, 30)
+            scheduled = self.call(
+                "support_callback",
+                purpose="ticket_status",
+                callback_time="tomorrow at 3 PM",
+                attempt=1,
+            )
         self.assertEqual(scheduled["action"], "schedule_callback")
-        self.assertEqual(scheduled["callback_time"], "tomorrow at 3 PM")
-        self.assertEqual(scheduled["information"]["time"], "tomorrow at 3 PM")
+        self.assertEqual(scheduled["callback_time"], "October 1, 2026 at 3 PM")
+        self.assertEqual(scheduled["information"]["time"], "October 1, 2026 at 3 PM")
+        self.assertIn("October 1, 2026 at 3 PM", scheduled["directive"]["response_text"])
+
+    def test_relative_callback_time_resolves_today_and_day_after_tomorrow(self) -> None:
+        today = real_date(2026, 9, 30)
+
+        self.assertEqual(
+            self.router._resolve_callback_time("today at 5 PM", today=today),
+            "September 30, 2026 at 5 PM",
+        )
+        self.assertEqual(
+            self.router._resolve_callback_time("day after tomorrow morning", today=today),
+            "October 2, 2026 in the morning",
+        )
+        self.assertEqual(
+            self.router._resolve_callback_time("tomorrow after 6 pm", today=today),
+            "October 1, 2026 at 6:30 PM",
+        )
 
     def test_callback_time_is_only_requested_once(self) -> None:
         self.call("support_callback", purpose="customer_support")
@@ -211,7 +235,18 @@ class RealtimeToolRouterTest(unittest.TestCase):
         self.assertEqual(order["action"], "return_order_status")
         self.assertEqual(ticket["purpose"], "ticket_status")
         self.assertEqual(ticket["action"], "return_ticket_status")
+        self.assertIn("4, 8, 2, 1", ticket["directive"]["response_text"])
         self.assertEqual(self.session.pending_intent, "ticket_status")
+
+    def test_changed_name_resets_identity_before_new_match(self) -> None:
+        self.call("customer_identity", name="John Carper")
+        self.assertEqual(self.session.customer_id, "cust_1002")
+
+        result = self.call("customer_identity", name="Arjun Mehta")
+
+        self.assertEqual(result["action"], "ready_for_lookup")
+        self.assertEqual(self.session.customer_id, "cust_1004")
+        self.assertEqual(self.session.customer_full_name, "Arjun Mehta")
 
 
 if __name__ == "__main__":

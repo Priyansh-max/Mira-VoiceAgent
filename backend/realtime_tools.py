@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any, Dict
 
 from backend.config import get_response_mode
@@ -15,6 +16,8 @@ from backend.tools import (
     resolve_customer_identity,
     schedule_callback,
 )
+
+_SPOKEN_DIGIT_KEYS = {"order_id", "case_id", "ticket_id"}
 
 
 class RealtimeToolError(ValueError):
@@ -47,8 +50,8 @@ class RealtimeToolRouter:
             session.order_id = order_id
         if ticket_id:
             session.ticket_id = ticket_id
-        if callback_time:
-            session.callback_time = callback_time
+        if callback_time and tool_name != "support_callback":
+            session.callback_time = self._resolve_callback_time(callback_time)
 
         if tool_name == "customer_identity":
             action, key, information = self._identity(
@@ -59,7 +62,12 @@ class RealtimeToolRouter:
                 attempt=attempt,
             )
         elif tool_name == "customer_lookup":
-            action, key, information = self._lookup(session=session, purpose=purpose)
+            action, key, information = self._lookup(
+                session=session,
+                purpose=purpose,
+                order_id=order_id,
+                ticket_id=ticket_id,
+            )
         else:
             action, key, information = self._callback(
                 session=session,
@@ -70,7 +78,7 @@ class RealtimeToolRouter:
         response_mode = get_response_mode()
         directive = None
         if key is not None:
-            directive_text = DIRECTIVES[key].format(**information)
+            directive_text = DIRECTIVES[key].format(**self._speech_information(information))
             directive = {
                 "key": key,
                 "response_text": directive_text,
@@ -141,6 +149,7 @@ class RealtimeToolRouter:
                 supplied_attempt=attempt,
             )
 
+        self._reset_identity_if_name_changed(session, caller_name)
         session.claimed_name = caller_name
         session.user_name = caller_name
         identified = identify_customer(caller_name)
@@ -197,7 +206,14 @@ class RealtimeToolRouter:
             {"customer_id": session.customer_id, "customer_name": session.customer_full_name},
         )
 
-    def _lookup(self, *, session: SessionState, purpose: str) -> tuple[str, str | None, Dict[str, Any]]:
+    def _lookup(
+        self,
+        *,
+        session: SessionState,
+        purpose: str,
+        order_id: str,
+        ticket_id: str,
+    ) -> tuple[str, str | None, Dict[str, Any]]:
         if purpose == "customer_support":
             return (
                 "route_to_callback",
@@ -210,7 +226,8 @@ class RealtimeToolRouter:
             return "route_to_identity", key, {}
 
         if purpose == "order_status":
-            if not session.order_id:
+            effective_order_id = order_id or session.order_id or ""
+            if not effective_order_id:
                 return self._request_or_repair(
                     session=session,
                     field_name="order_id",
@@ -219,8 +236,9 @@ class RealtimeToolRouter:
                     repair_key="customer_lookup.order_status.repeat_order_id",
                     supplied_attempt=0,
                 )
+            session.order_id = effective_order_id
             result = get_order_status(
-                session.order_id,
+                effective_order_id,
                 customer_id=session.customer_id,
                 verified=session.verified,
             )
@@ -228,7 +246,7 @@ class RealtimeToolRouter:
                 return (
                     "route_to_callback",
                     "customer_lookup.order_status.not_found",
-                    {"order_id": session.order_id},
+                    {"order_id": effective_order_id},
                 )
             record = result["record"]
             return (
@@ -237,7 +255,8 @@ class RealtimeToolRouter:
                 {"order_id": record["order_id"], "status": record["status"]},
             )
 
-        if not session.ticket_id:
+        effective_ticket_id = ticket_id or session.ticket_id or ""
+        if not effective_ticket_id:
             return self._request_or_repair(
                 session=session,
                 field_name="ticket_id",
@@ -246,8 +265,9 @@ class RealtimeToolRouter:
                 repair_key="customer_lookup.ticket_status.repeat_ticket_id",
                 supplied_attempt=0,
             )
+        session.ticket_id = effective_ticket_id
         result = lookup_ticket(
-            session.ticket_id,
+            effective_ticket_id,
             customer_id=session.customer_id,
             verified=session.verified,
         )
@@ -255,7 +275,7 @@ class RealtimeToolRouter:
             return (
                 "route_to_callback",
                 "customer_lookup.ticket_status.not_found",
-                {"case_id": session.ticket_id},
+                {"case_id": effective_ticket_id},
             )
         record = result["record"]
         return (
@@ -275,7 +295,7 @@ class RealtimeToolRouter:
         purpose: str,
         callback_time: str,
     ) -> tuple[str, str, Dict[str, Any]]:
-        requested_time = callback_time or session.callback_time or ""
+        requested_time = self._resolve_callback_time(callback_time or session.callback_time or "")
         if not requested_time and session.information_attempts.get("callback_time", 0) < 1:
             self._mark_requested(session, "callback_time")
             return (
@@ -315,9 +335,94 @@ class RealtimeToolRouter:
         )
 
     @staticmethod
+    def _resolve_callback_time(value: str, *, today: date | None = None) -> str:
+        text = value.strip()
+        if not text:
+            return ""
+
+        base_date = today or date.today()
+        relative_days = (
+            (r"\bday\s+after\s+tomorrow\b", 2),
+            (r"\btomorrow\b", 1),
+            (r"\btoday\b", 0),
+        )
+        for pattern, days in relative_days:
+            if not re.search(pattern, text, flags=re.IGNORECASE):
+                continue
+            target = base_date + timedelta(days=days)
+            remainder = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
+            remainder = remainder.strip(" ,.-")
+            resolved = f"{target.strftime('%B')} {target.day}, {target.year}"
+            if not remainder:
+                return resolved
+            lowered = remainder.lower()
+            after_time = RealtimeToolRouter._resolve_after_time(remainder)
+            if after_time:
+                suffix = f"at {after_time}"
+            elif lowered.startswith(("at ", "in ", "on ")):
+                suffix = remainder
+            elif re.search(r"\d|a\.?m\.?|p\.?m\.?|noon|midnight", lowered):
+                suffix = f"at {remainder}"
+            elif lowered in {"morning", "afternoon", "evening", "night"}:
+                suffix = f"in the {lowered}"
+            else:
+                suffix = remainder
+            return f"{resolved} {suffix}"
+        return text
+
+    @staticmethod
+    def _resolve_after_time(value: str) -> str:
+        match = re.fullmatch(
+            r"after\s+(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)",
+            value.strip(),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return ""
+
+        hour = int(match.group(1))
+        minute = int(match.group(2) or "0")
+        if hour < 1 or hour > 12 or minute > 59:
+            return ""
+
+        meridiem = match.group(3).lower().replace(".", "")
+        if meridiem == "pm" and hour != 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+
+        slot = datetime.combine(date(2000, 1, 1), datetime_time(hour, minute)) + timedelta(minutes=30)
+        display_hour = slot.hour % 12 or 12
+        display_meridiem = "AM" if slot.hour < 12 else "PM"
+        return f"{display_hour}:{slot.minute:02d} {display_meridiem}"
+
+    @classmethod
+    def _speech_information(cls, information: Dict[str, Any]) -> Dict[str, Any]:
+        speech_ready = dict(information)
+        for key in _SPOKEN_DIGIT_KEYS:
+            value = speech_ready.get(key)
+            if isinstance(value, str) and re.fullmatch(r"\d{2,}", value):
+                speech_ready[key] = ", ".join(value)
+        return speech_ready
+
+    @staticmethod
     def _phone_last4(value: str) -> str:
         digits = re.sub(r"\D", "", value)
         return digits[-4:] if len(digits) >= 4 else ""
+
+    @staticmethod
+    def _reset_identity_if_name_changed(session: SessionState, caller_name: str) -> None:
+        previous = (session.claimed_name or "").strip().casefold()
+        current = caller_name.strip().casefold()
+        if not previous or previous == current:
+            return
+        session.customer_id = None
+        session.customer_full_name = None
+        session.verified = False
+        session.verification_method = None
+        session.candidate_customer_ids = []
+        session.phone_last4 = None
+        session.last_verification_outcome = None
 
     @staticmethod
     def _mark_requested(session: SessionState, field_name: str) -> None:

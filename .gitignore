@@ -6,3 +6,9 @@ frontend/node_modules/
 __pycache__/
 *.pyc
 tmp/
+assignment_interview_notes.md
+new_architecture.md
+preparation.md
+project.md
+output/pdf/
+scripts/

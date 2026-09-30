@@ -5,6 +5,9 @@ from typing import Any, Dict
 
 from openai import OpenAI
 
+from backend.prompts import REALTIME_AGENT_PROMPT
+from backend.tool_contract import grouped_tool_schemas
+
 
 class RealtimeConfigError(RuntimeError):
     """Raised when realtime bootstrap cannot be created."""
@@ -18,96 +21,9 @@ def _client() -> OpenAI:
 
 
 def _tool_schemas() -> list[Dict[str, Any]]:
-    return [
-        {
-            "type": "function",
-            "name": "identify_customer",
-            "description": "Find a customer profile by name before accessing protected records.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "The customer's name. Prefer the full name when available.",
-                    }
-                },
-                "required": ["name"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "type": "function",
-            "name": "verify_customer",
-            "description": "Verify a selected customer using the last 4 digits of the phone number.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "customer_id": {
-                        "type": "string",
-                        "description": "The selected customer identifier from identify_customer.",
-                    },
-                    "phone_last4": {
-                        "type": "string",
-                        "description": "Last 4 digits of the customer's phone number.",
-                    },
-                },
-                "required": ["customer_id", "phone_last4"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "type": "function",
-            "name": "lookup_ticket",
-            "description": "Look up a ticket status by ticket ID after verification.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "case_id": {
-                        "type": "string",
-                        "description": "The ticket or case ID, for example 4821.",
-                    }
-                },
-                "required": ["case_id"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "type": "function",
-            "name": "get_order_status",
-            "description": "Look up an order status by order ID after verification.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "order_id": {
-                        "type": "string",
-                        "description": "The order ID, for example 1234.",
-                    }
-                },
-                "required": ["order_id"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "type": "function",
-            "name": "schedule_callback",
-            "description": "Schedule a callback from a human support agent.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "when": {
-                        "type": "string",
-                        "description": "Preferred callback time, such as tomorrow morning or next available time.",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Short reason for the callback request.",
-                    },
-                },
-                "required": [],
-                "additionalProperties": False,
-            },
-        },
-    ]
+    # Realtime function tools use a slightly different shape than Chat
+    # Completions tools and currently reject a top-level `strict` field.
+    return grouped_tool_schemas(include_strict=False)
 
 
 def _session_config() -> Dict[str, Any]:
@@ -121,16 +37,7 @@ def _session_config() -> Dict[str, Any]:
     return {
         "type": "realtime",
         "model": os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime-mini"),
-        "instructions": (
-            "You are a helpful customer support voice assistant. "
-            "Be concise, friendly, and natural in speech. "
-            "Ask one clarifying question at a time. "
-            "Do not invent account or ticket information. "
-            "Use a tool only when you need backend data or need to take a backend action. "
-            "For greetings, simple follow-up questions, and general unsupported questions, answer directly without calling a tool. "
-            "Ticket and order lookups are protected and require verification first. "
-            "If a tool result includes policy_outcome, follow it closely and ask only for the missing detail when needed."
-        ),
+        "instructions": REALTIME_AGENT_PROMPT,
         "tools": _tool_schemas(),
         "tool_choice": "auto",
         "audio": {
@@ -158,6 +65,10 @@ def _session_config() -> Dict[str, Any]:
             },
         },
         "output_modalities": ["audio"],
+        "truncation": {
+            "type": "retention_ratio",
+            "retention_ratio": 0.8,
+        },
         "tracing": "auto",
     }
 

@@ -17,6 +17,7 @@ from backend.tools import (
     verify_customer,
 )
 from backend.trace import TraceEvent, TraceStore
+from backend.realtime_tools import RealtimeToolRouter
 
 
 class TextAgentConfigError(RuntimeError):
@@ -352,6 +353,7 @@ class OpenAITextAgent:
             if extracted_order_id:
                 session.order_id = extracted_order_id
 
+#boss function
     def handle_text(self, *, session: SessionState, text: str, trace: TraceStore) -> str:
         prior_claimed_name = session.claimed_name
         prior_phone_last4 = session.phone_last4
@@ -794,139 +796,14 @@ class OpenAITextAgent:
         tool_name: str,
         tool_args: Dict[str, Any],
     ) -> Dict[str, Any]:
-        normalized_args = tool_args if isinstance(tool_args, dict) else {}
-
-        name_value = normalized_args.get("full_name") or normalized_args.get("name")
-        if isinstance(name_value, str):
-            extracted_name = (
-                self._extract_name_candidate(name_value)
-                or self._extract_full_name(name_value)
-                or name_value.strip()
-            )
-            if extracted_name:
-                session.claimed_name = extracted_name.strip()
-                if not session.user_name:
-                    session.user_name = session.claimed_name
-
-        phone_last4 = normalized_args.get("phone_last4")
-        if isinstance(phone_last4, str) and re.fullmatch(r"\d{4}", phone_last4.strip()):
-            session.phone_last4 = phone_last4.strip()
-
-        customer_id = normalized_args.get("customer_id")
-        if isinstance(customer_id, str) and customer_id.strip():
-            session.customer_id = customer_id.strip()
-
-        ticket_id = normalized_args.get("case_id") or normalized_args.get("ticket_id")
-        if isinstance(ticket_id, str) and ticket_id.strip():
-            session.ticket_id = ticket_id.strip()
-
-        order_id = normalized_args.get("order_id")
-        if isinstance(order_id, str) and order_id.strip():
-            session.order_id = order_id.strip()
-
-        if tool_name == "lookup_ticket":
-            session.pending_intent = "lookup_ticket"
-        elif tool_name == "get_order_status":
-            session.pending_intent = "order_status"
-
-        if tool_name == "identify_customer" and not session.claimed_name:
-            policy_outcome = self._build_policy_outcome(
-                code="need_full_name",
-                safe_facts={},
-                allowed_next_steps=["Ask for the customer's full name."],
-            )
-            session.last_policy_code = policy_outcome["code"]
-            return {
-                "tool_name": tool_name,
-                "tool_result": None,
-                "policy_outcome": policy_outcome,
-                "session_state": self._session_snapshot(session),
-            }
-
-        if tool_name == "verify_customer" and not (session.phone_last4 or normalized_args.get("phone_last4")):
-            policy_outcome = self._build_policy_outcome(
-                code="need_phone_last4",
-                safe_facts={"customer_full_name": session.customer_full_name},
-                allowed_next_steps=["Ask for the last 4 digits of the phone number."],
-            )
-            session.last_policy_code = policy_outcome["code"]
-            return {
-                "tool_name": tool_name,
-                "tool_result": None,
-                "policy_outcome": policy_outcome,
-                "session_state": self._session_snapshot(session),
-            }
-
-        if tool_name == "lookup_ticket" and not session.ticket_id:
-            policy_outcome = self._build_policy_outcome(
-                code="need_ticket_id",
-                safe_facts={},
-                allowed_next_steps=["Ask for the ticket ID."],
-            )
-            session.last_policy_code = policy_outcome["code"]
-            return {
-                "tool_name": tool_name,
-                "tool_result": None,
-                "policy_outcome": policy_outcome,
-                "session_state": self._session_snapshot(session),
-            }
-
-        if tool_name == "get_order_status" and not session.order_id:
-            policy_outcome = self._build_policy_outcome(
-                code="need_order_id",
-                safe_facts={},
-                allowed_next_steps=["Ask for the order ID."],
-            )
-            session.last_policy_code = policy_outcome["code"]
-            return {
-                "tool_name": tool_name,
-                "tool_result": None,
-                "policy_outcome": policy_outcome,
-                "session_state": self._session_snapshot(session),
-            }
-
-        tool_result = self._run_tool(
+        # Compatibility entry point for older callers. The realtime endpoint
+        # now uses RealtimeToolRouter directly.
+        return RealtimeToolRouter().execute(
             session=session,
-            trace=trace,
-            plan={"tool_name": tool_name, "tool_args": normalized_args},
+            tool_name=tool_name,
+            tool_args=tool_args,
         )
-        if tool_result is None:
-            raise TextAgentConfigError(f"Realtime requested unsupported or invalid tool call: {tool_name}")
 
-        intent = self._intent_for_tool_name(tool_name, session)
-        policy_outcome = self._policy_outcome_from_tool_result(
-            session=session,
-            intent=intent,
-            tool_result=tool_result,
-        )
-        session.last_policy_code = policy_outcome["code"]
-        trace.emit(
-            TraceEvent(
-                session_id=session.session_id,
-                type="policy_outcome",
-                message=f"Policy outcome: {policy_outcome['code']}",
-                data=policy_outcome,
-            )
-        )
-        return {
-            "tool_name": tool_name,
-            "tool_result": tool_result,
-            "policy_outcome": policy_outcome,
-            "session_state": self._session_snapshot(session),
-        }
-
-    def _session_snapshot(self, session: SessionState) -> Dict[str, Any]:
-        return {
-            "claimed_name": session.claimed_name,
-            "customer_id": session.customer_id,
-            "customer_full_name": session.customer_full_name,
-            "verified": session.verified,
-            "phone_last4": session.phone_last4,
-            "pending_intent": session.pending_intent,
-            "ticket_id": session.ticket_id,
-            "order_id": session.order_id,
-            "last_policy_code": session.last_policy_code,
-        }
 
     def _build_policy_outcome(
         self,

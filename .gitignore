@@ -1,0 +1,7 @@
+backend/.env
+backend/data/
+completelog*.txt
+frontend/dist/
+frontend/node_modules/
+__pycache__/
+*.pyc

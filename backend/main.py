@@ -171,6 +171,7 @@ def create_pipeline_session() -> PipelineSessionResponse:
 async def run_pipeline_turn(
     session_id: str = Form(...),
     turn_id: str = Form(...),
+    audio_duration_ms: float | None = Form(None),
     audio: UploadFile = File(...),
 ) -> PipelineTurnResponse:
     backend_started_at = time.perf_counter()
@@ -193,7 +194,15 @@ async def run_pipeline_turn(
         )
     except stt.SpeechToTextError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    audio_duration_seconds = stt.wav_duration_seconds(audio_bytes, content_type=content_type)
+    measured_duration_seconds = (
+        max(0.0, audio_duration_ms / 1000.0)
+        if audio_duration_ms is not None and audio_duration_ms > 0
+        else None
+    )
+    audio_duration_seconds = (
+        stt.wav_duration_seconds(audio_bytes, content_type=content_type)
+        or measured_duration_seconds
+    )
     if transcript and stt.transcript_is_implausible(
         transcript,
         audio_duration_seconds=audio_duration_seconds,

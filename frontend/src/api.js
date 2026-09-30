@@ -16,7 +16,7 @@ export async function deleteSession(sessionId) {
   return res.json();
 }
 
-export async function runPipelineTurn(sessionId, turnId, audioBlob) {
+export async function runPipelineTurn(sessionId, turnId, audioBlob, audioDurationMs = null) {
   const form = new FormData();
   const mediaType = (audioBlob.type || 'audio/webm').split(';', 1)[0];
   const extension = {
@@ -28,6 +28,9 @@ export async function runPipelineTurn(sessionId, turnId, audioBlob) {
   }[mediaType] || 'webm';
   form.append('session_id', sessionId);
   form.append('turn_id', turnId);
+  if (Number.isFinite(audioDurationMs) && audioDurationMs > 0) {
+    form.append('audio_duration_ms', String(audioDurationMs));
+  }
   form.append('audio', audioBlob, `turn.${extension}`);
   const res = await fetch(`${API}/pipeline/turn`, {
     method: 'POST',

@@ -244,7 +244,12 @@ export default function ChainedVoicePanel({
     setStatus('thinking');
     try {
       const pipelineStartedAt = performance.now();
-      const result = await runPipelineTurn(activeSessionId, turn.turnId, audioBlob);
+      const result = await runPipelineTurn(
+        activeSessionId,
+        turn.turnId,
+        audioBlob,
+        turn.audioDurationMs,
+      );
       const pipelineCompletedAt = performance.now();
       if (!mountedRef.current || sessionIdRef.current !== activeSessionId) return;
       const audioBlobOut = base64ToBlob(result.audio_base64, result.audio_media_type);

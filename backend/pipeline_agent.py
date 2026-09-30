@@ -327,6 +327,8 @@ class ChainedPipelineAgent:
         chained_calls = set()
 
         while result["action"] in {"ready_for_lookup", "route_to_callback", "route_to_identity"}:
+            if result.get("directive"):
+                break
             next_tool = {
                 "ready_for_lookup": "customer_lookup",
                 "route_to_callback": "support_callback",

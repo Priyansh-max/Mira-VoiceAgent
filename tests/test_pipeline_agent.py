@@ -112,6 +112,41 @@ class PipelineToolTraceTest(unittest.TestCase):
         self.assertIn("digits one at a time", result["response_text"])
         self.assertIsNone(result["llm_ttft_ms"])
 
+    def test_directive_route_to_callback_is_spoken_before_callback_tool(self) -> None:
+        agent = ChainedPipelineAgent()
+        session = SessionState(session_id="test-session")
+        tool_input = {
+            "purpose": "order_status",
+            "caller_name": "Unknown Person",
+            "caller_phone": None,
+            "order_id": None,
+            "ticket_id": None,
+            "callback_time": None,
+            "attempt": 0,
+        }
+
+        result, events = agent._run_tool_chain(
+            session=session,
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "customer_identity",
+                        "arguments": json.dumps(tool_input),
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(result["action"], "route_to_callback")
+        self.assertEqual(
+            result["directive"]["key"],
+            "customer_identity.order_status.no_name_match",
+        )
+        self.assertIn("Would you like me to set up a callback?", result["directive"]["response_text"])
+        self.assertEqual([event["tool_name"] for event in events], ["customer_identity"])
+
 
 if __name__ == "__main__":
     unittest.main()

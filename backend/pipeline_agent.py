@@ -8,7 +8,6 @@ from typing import Any, Dict, Iterable, Optional
 
 from openai import OpenAI
 
-from backend.config import get_response_mode
 from backend.conversation import SessionState, expected_information_field
 from backend.prompts import REALTIME_AGENT_PROMPT
 from backend.realtime_tools import RealtimeToolRouter
@@ -53,8 +52,12 @@ def _history_messages(session: SessionState) -> list[Dict[str, str]]:
     return messages
 
 
-def _compact_tool_result(tool_result: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+def _compact_tool_result(
+    tool_result: Dict[str, Any],
+    *,
+    include_directive: bool = True,
+) -> Dict[str, Any]:
+    compact = {
         "purpose": tool_result.get("purpose"),
         "action": tool_result.get("action"),
         "caller_name": tool_result.get("caller_name"),
@@ -64,10 +67,12 @@ def _compact_tool_result(tool_result: Dict[str, Any]) -> Dict[str, Any]:
         "callback_time": tool_result.get("callback_time"),
         "attempt": tool_result.get("attempt"),
         "information": tool_result.get("information"),
-        "directive": tool_result.get("directive"),
         "response_mode": tool_result.get("response_mode"),
         "backend_tool_ms": tool_result.get("backend_tool_ms"),
     }
+    if include_directive:
+        compact["directive"] = tool_result.get("directive")
+    return compact
 
 
 _EXPLICIT_REFUSAL = re.compile(
@@ -163,7 +168,7 @@ class ChainedPipelineAgent:
         self.router = RealtimeToolRouter()
 
     def handle_text(self, *, session: SessionState, text: str) -> Dict[str, Any]:
-        response_mode = get_response_mode()
+        response_mode = session.response_mode
         messages = [
             {"role": "system", "content": REALTIME_AGENT_PROMPT},
             *_history_messages(session),
@@ -209,7 +214,12 @@ class ChainedPipelineAgent:
             }
 
         tool_started_at = time.perf_counter()
-        tool_result, tool_events = self._run_tool_chain(session=session, tool_calls=tool_calls)
+        use_directive_result = response_mode == "speech_directive"
+        tool_result, tool_events = self._run_tool_chain(
+            session=session,
+            tool_calls=tool_calls,
+            include_directive=use_directive_result,
+        )
         tool_round_trip_ms = round((time.perf_counter() - tool_started_at) * 1000, 1)
 
         if response_mode == "speech_directive":
@@ -242,7 +252,7 @@ class ChainedPipelineAgent:
             "response_text": final_text,
             "response_mode": response_mode,
             "has_tool_call": True,
-            "tool_result": _compact_tool_result(tool_result),
+            "tool_result": _compact_tool_result(tool_result, include_directive=False),
             "tool_calls": tool_events,
             "llm_ttft_ms": combined_ttft_ms or second_ttft_ms,
             "llm_total_ms": combined_total_ms,
@@ -287,6 +297,7 @@ class ChainedPipelineAgent:
         tool_result, tool_events = self._run_tool_chain(
             session=session,
             tool_calls=[tool_call],
+            include_directive=True,
         )
         tool_round_trip_ms = round((time.perf_counter() - tool_started_at) * 1000, 1)
         directive_text = (tool_result.get("directive") or {}).get("response_text")
@@ -298,7 +309,7 @@ class ChainedPipelineAgent:
         session.conversation_history[:] = session.conversation_history[-16:]
         return {
             "response_text": directive_text,
-            "response_mode": get_response_mode(),
+            "response_mode": session.response_mode,
             "has_tool_call": True,
             "tool_result": _compact_tool_result(tool_result),
             "tool_calls": tool_events,
@@ -312,6 +323,7 @@ class ChainedPipelineAgent:
         *,
         session: SessionState,
         tool_calls: list[Dict[str, Any]],
+        include_directive: bool = True,
     ) -> tuple[Dict[str, Any], list[Dict[str, Any]]]:
         current = tool_calls[0]
         name = current["function"]["name"]
@@ -321,7 +333,7 @@ class ChainedPipelineAgent:
             {
                 "tool_name": name,
                 "input": args,
-                "response": _compact_tool_result(result),
+                "response": _compact_tool_result(result, include_directive=include_directive),
             }
         ]
         chained_calls = set()
@@ -352,7 +364,7 @@ class ChainedPipelineAgent:
                 {
                     "tool_name": next_tool,
                     "input": next_args,
-                    "response": _compact_tool_result(result),
+                    "response": _compact_tool_result(result, include_directive=include_directive),
                 }
             )
 
@@ -384,7 +396,7 @@ class ChainedPipelineAgent:
         tool_message = {
             "role": "tool",
             "tool_call_id": call_id,
-            "content": json.dumps(_compact_tool_result(tool_result)),
+            "content": json.dumps(_compact_tool_result(tool_result, include_directive=False)),
         }
         try:
             llm_started_at = time.perf_counter()
@@ -405,8 +417,7 @@ class ChainedPipelineAgent:
 
         cleaned = text.strip()
         if not cleaned:
-            directive_text = (tool_result.get("directive") or {}).get("response_text")
-            cleaned = directive_text or "I handled that request."
+            cleaned = "I handled that request."
         return cleaned, ttft_ms, total_ms
 
     @staticmethod

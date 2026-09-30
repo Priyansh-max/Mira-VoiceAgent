@@ -5,7 +5,6 @@ import time
 from datetime import date, datetime, time as datetime_time, timedelta
 from typing import Any, Dict
 
-from backend.config import get_response_mode
 from backend.conversation import SessionState
 from backend.speech_directives import DIRECTIVES
 from backend.tool_contract import PURPOSES, TOOL_NAMES
@@ -75,7 +74,7 @@ class RealtimeToolRouter:
                 callback_time=callback_time,
             )
 
-        response_mode = get_response_mode()
+        response_mode = session.response_mode
         directive = None
         if key is not None:
             directive_text = DIRECTIVES[key].format(**self._speech_information(information))

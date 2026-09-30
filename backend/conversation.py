@@ -5,10 +5,13 @@ from typing import Any, Dict, List, Optional
 import time
 import uuid
 
+from backend.config import ResponseMode, get_response_mode
+
 
 @dataclass
 class SessionState:
     session_id: str
+    response_mode: ResponseMode = field(default_factory=get_response_mode)
     user_name: Optional[str] = None
     claimed_name: Optional[str] = None
     customer_id: Optional[str] = None
@@ -37,9 +40,9 @@ class ConversationStore:
     def __init__(self) -> None:
         self._sessions: Dict[str, SessionState] = {}
 
-    def create_session(self) -> SessionState:
+    def create_session(self, *, response_mode: ResponseMode | None = None) -> SessionState:
         session_id = str(uuid.uuid4())
-        session = SessionState(session_id=session_id)
+        session = SessionState(session_id=session_id, response_mode=response_mode or get_response_mode())
         self._sessions[session_id] = session
         return session
 

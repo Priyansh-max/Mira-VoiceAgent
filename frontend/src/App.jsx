@@ -2,10 +2,10 @@ import { useCallback, useEffect, useState } from 'react';
 import ChainedVoicePanel from './components/ChainedVoicePanel';
 import RealtimeVoicePanel from './components/RealtimeVoicePanel';
 
-function VoiceControls({ voiceMode, onModeChange, onNewSession }) {
+function VoiceControls({ voiceMode, responseMode, onModeChange, onResponseModeChange, onNewSession }) {
   return (
     <div className="embedded-voice-controls" aria-label="Voice implementation">
-      <div className="embedded-mode-switch">
+      <div className="embedded-mode-switch" aria-label="Transport mode">
         <button
           type="button"
           className={voiceMode === 'pipeline' ? 'active' : ''}
@@ -15,10 +15,33 @@ function VoiceControls({ voiceMode, onModeChange, onNewSession }) {
         </button>
         <button
           type="button"
+          className={voiceMode === 'streaming' ? 'active' : ''}
+          onClick={() => onModeChange('streaming')}
+        >
+          Streaming
+        </button>
+        <button
+          type="button"
           className={voiceMode === 'realtime' ? 'active' : ''}
           onClick={() => onModeChange('realtime')}
         >
           Legacy
+        </button>
+      </div>
+      <div className="embedded-mode-switch embedded-response-switch" aria-label="Response mode">
+        <button
+          type="button"
+          className={responseMode === 'llm' ? 'active' : ''}
+          onClick={() => onResponseModeChange('llm')}
+        >
+          LLM
+        </button>
+        <button
+          type="button"
+          className={responseMode === 'speech_directive' ? 'active' : ''}
+          onClick={() => onResponseModeChange('speech_directive')}
+        >
+          Directive
         </button>
       </div>
       <button
@@ -39,6 +62,7 @@ export default function App() {
   const [error, setError] = useState(null);
   const [voiceResetToken, setVoiceResetToken] = useState(0);
   const [voiceMode, setVoiceMode] = useState('pipeline');
+  const [responseMode, setResponseMode] = useState('speech_directive');
 
   useEffect(() => {
     if (sessionId) {
@@ -68,10 +92,20 @@ export default function App() {
     setVoiceResetToken((current) => current + 1);
   }, []);
 
+  const switchResponseMode = useCallback((nextMode) => {
+    setResponseMode(nextMode);
+    setError(null);
+    setSessionId('');
+    localStorage.removeItem('mira-voice-session');
+    setVoiceResetToken((current) => current + 1);
+  }, []);
+
   const voiceControls = (
     <VoiceControls
       voiceMode={voiceMode}
+      responseMode={responseMode}
       onModeChange={switchVoiceMode}
+      onResponseModeChange={switchResponseMode}
       onNewSession={startNewSession}
     />
   );
@@ -91,13 +125,15 @@ export default function App() {
       )}
 
       <main className="mira-main">
-        {voiceMode === 'pipeline' ? (
+        {voiceMode === 'pipeline' || voiceMode === 'streaming' ? (
           <ChainedVoicePanel
             sessionId={sessionId}
             resetToken={voiceResetToken}
             onSessionChange={handleSessionChange}
             onError={setError}
             controls={voiceControls}
+            transportMode={voiceMode}
+            responseMode={responseMode}
           />
         ) : (
           <RealtimeVoicePanel
@@ -106,6 +142,7 @@ export default function App() {
             onSessionChange={handleSessionChange}
             onError={setError}
             controls={voiceControls}
+            responseMode={responseMode}
           />
         )}
       </main>

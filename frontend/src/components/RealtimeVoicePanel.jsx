@@ -171,6 +171,7 @@ export default function RealtimeVoicePanel({
   onSessionChange,
   onError,
   controls,
+  responseMode = 'speech_directive',
 }) {
   const [status, setStatus] = useState('idle');
   const [realtimeMeta, setRealtimeMeta] = useState(null);
@@ -215,6 +216,7 @@ export default function RealtimeVoicePanel({
       response_mode: turn.responseMode,
       has_tool_call: turn.hasToolCall,
       transcript: turn.transcript || null,
+      agent_response: turn.agentResponse || null,
       measurement_source: turn.playbackStartedAt ? 'output_energy' : 'first_audio_event',
       end_of_speech_detection_ms: duration(turn.localSpeechEndAt, turn.turnDetectedAt) || 0,
       stt_ms: duration(turn.turnDetectedAt, turn.transcriptCompletedAt),
@@ -428,7 +430,7 @@ export default function RealtimeVoicePanel({
     try {
       await cleanupPromiseRef.current;
       if (!mountedRef.current || connectAttemptRef.current !== attemptId) return;
-      const realtime = await createRealtimeSession();
+      const realtime = await createRealtimeSession(responseMode);
       if (!mountedRef.current || connectAttemptRef.current !== attemptId) {
         void cleanupBackendSession(realtime.app_session_id);
         return;
@@ -510,6 +512,7 @@ export default function RealtimeVoicePanel({
               finalResponseDoneAt: null,
               firstAudioAt: null,
               playbackStartedAt: null,
+              agentResponse: '',
               hasToolCall: false,
               submitted: false,
             };
@@ -527,6 +530,9 @@ export default function RealtimeVoicePanel({
               activeTurnRef.current.transcript = event.transcript || '';
               activeTurnRef.current.transcriptCompletedAt = now;
             }
+          }
+          if ((AUDIO_TRANSCRIPT_DONE_EVENTS.has(event?.type) || event?.type === 'response.output_text.done') && activeTurnRef.current) {
+            activeTurnRef.current.agentResponse = event.transcript || event.text || activeTurnRef.current.agentResponse || '';
           }
           if (
             event?.type === 'response.function_call_arguments.delta'
@@ -636,7 +642,7 @@ export default function RealtimeVoicePanel({
       setStatus('error');
       onError?.(error.message || 'Realtime connection failed');
     }
-  }, [cleanupBackendSession, completeTurn, disconnect, handleFunctionCall, onError, onSessionChange, pushEvent]);
+  }, [cleanupBackendSession, completeTurn, disconnect, handleFunctionCall, onError, onSessionChange, pushEvent, responseMode]);
 
   const callActive = status === 'connected' || status === 'connecting';
   const activityState = isUserSpeaking

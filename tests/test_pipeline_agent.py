@@ -147,6 +147,38 @@ class PipelineToolTraceTest(unittest.TestCase):
         self.assertIn("Would you like me to set up a callback?", result["directive"]["response_text"])
         self.assertEqual([event["tool_name"] for event in events], ["customer_identity"])
 
+    def test_llm_mode_tool_trace_omits_directive_text(self) -> None:
+        agent = ChainedPipelineAgent()
+        session = SessionState(session_id="test-session")
+        tool_input = {
+            "purpose": "order_status",
+            "caller_name": "Unknown Person",
+            "caller_phone": None,
+            "order_id": None,
+            "ticket_id": None,
+            "callback_time": None,
+            "attempt": 0,
+        }
+
+        result, events = agent._run_tool_chain(
+            session=session,
+            tool_calls=[
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "customer_identity",
+                        "arguments": json.dumps(tool_input),
+                    },
+                }
+            ],
+            include_directive=False,
+        )
+
+        self.assertEqual(result["action"], "route_to_callback")
+        self.assertIsNotNone(result["directive"])
+        self.assertNotIn("directive", events[0]["response"])
+
 
 if __name__ == "__main__":
     unittest.main()

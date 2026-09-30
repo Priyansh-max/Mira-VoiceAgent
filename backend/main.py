@@ -8,9 +8,9 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Iterator
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -24,7 +24,7 @@ from backend.pipeline_agent import ChainedPipelineAgent, PipelineAgentConfigErro
 from backend import stt
 from backend import tts
 from backend.trace import TraceEvent, TraceStore
-from backend.config import get_response_mode
+from backend.config import VALID_RESPONSE_MODES, ResponseMode, get_response_mode
 from backend.latency import LatencySample, LatencyStore
 
 
@@ -124,6 +124,145 @@ class PipelineTurnResponse(BaseModel):
     metrics: dict[str, float | None]
 
 
+def _stream_event(event: str, payload: dict[str, Any]) -> bytes:
+    return (json.dumps({"event": event, **payload}, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _resolve_response_mode(value: str | None) -> ResponseMode:
+    if not value:
+        return get_response_mode()
+    normalized = value.strip().lower()
+    if normalized not in VALID_RESPONSE_MODES:
+        raise ValueError(f"Unsupported response mode: {value}")
+    return normalized  # type: ignore[return-value]
+
+
+def _process_pipeline_audio(
+    *,
+    session_id: str,
+    turn_id: str,
+    audio_bytes: bytes,
+    content_type: str,
+    audio_duration_ms: float | None = None,
+) -> tuple[Any, str, dict[str, Any], float]:
+    try:
+        session = conversations.get_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown session_id")
+
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio")
+
+    expected_field = expected_information_field(session)
+    try:
+        transcript, stt_ms = stt.transcribe_with_timing(
+            audio_bytes,
+            content_type=content_type,
+            expected_field=expected_field,
+        )
+    except stt.SpeechToTextError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    measured_duration_seconds = (
+        max(0.0, audio_duration_ms / 1000.0)
+        if audio_duration_ms is not None and audio_duration_ms > 0
+        else None
+    )
+    audio_duration_seconds = (
+        stt.wav_duration_seconds(audio_bytes, content_type=content_type)
+        or measured_duration_seconds
+    )
+    if transcript and stt.transcript_is_implausible(
+        transcript,
+        audio_duration_seconds=audio_duration_seconds,
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="STT result was rejected because it could not plausibly fit in the captured audio.",
+        )
+    if not transcript and not expected_field:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "STT received the audio but found no speech "
+                f"({len(audio_bytes)} bytes, {content_type})."
+            ),
+        )
+
+    if transcript:
+        traces.emit(
+            TraceEvent(
+                session_id=session.session_id,
+                type="user_transcript",
+                message="User transcript received",
+                data={"text": transcript},
+            )
+        )
+    else:
+        traces.emit(
+            TraceEvent(
+                session_id=session.session_id,
+                type="recognition_repair",
+                message="Expected information was not recognized",
+                data={"expected_field": expected_field},
+            )
+        )
+
+    try:
+        if transcript:
+            agent_result = pipeline_agent.handle_text(session=session, text=transcript)
+        else:
+            agent_result = pipeline_agent.handle_unrecognized_capture(
+                session=session,
+                expected_field=expected_field,
+            )
+    except (PipelineAgentConfigError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    response_text = agent_result["response_text"]
+    traces.emit(
+        TraceEvent(
+            session_id=session.session_id,
+            type="assistant_transcript",
+            message="Assistant response generated",
+            data={
+                "text": response_text,
+                "response_mode": agent_result["response_mode"],
+                "has_tool_call": agent_result["has_tool_call"],
+                "tool_result": agent_result["tool_result"],
+                "tool_calls": agent_result["tool_calls"],
+            },
+        )
+    )
+    return session, transcript or "", agent_result, stt_ms
+
+
+def _pipeline_metadata_payload(
+    *,
+    session: Any,
+    turn_id: str,
+    transcript: str,
+    agent_result: dict[str, Any],
+    stt_ms: float,
+) -> dict[str, Any]:
+    return {
+        "session_id": session.session_id,
+        "turn_id": turn_id,
+        "transcript": transcript,
+        "response_text": agent_result["response_text"],
+        "response_mode": agent_result["response_mode"],
+        "has_tool_call": agent_result["has_tool_call"],
+        "audio_media_type": "audio/mpeg",
+        "tool_result": agent_result["tool_result"],
+        "tool_calls": agent_result["tool_calls"],
+        "metrics": {
+            "stt_ms": stt_ms,
+            "llm_ttft_ms": agent_result["llm_ttft_ms"],
+            "llm_total_ms": agent_result["llm_total_ms"],
+            "tool_round_trip_ms": agent_result["tool_round_trip_ms"],
+        },
+    }
+
+
 @app.get("/health")
 def health() -> dict:
     try:
@@ -145,24 +284,24 @@ def delete_session(session_id: str) -> DeleteSessionResponse:
 
 
 @app.post("/pipeline/session", response_model=PipelineSessionResponse)
-def create_pipeline_session() -> PipelineSessionResponse:
+def create_pipeline_session(response_mode: str | None = Query(None)) -> PipelineSessionResponse:
     try:
-        response_mode = get_response_mode()
+        resolved_mode = _resolve_response_mode(response_mode)
     except ValueError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    session = conversations.create_session()
+        raise HTTPException(status_code=400, detail=str(exc))
+    session = conversations.create_session(response_mode=resolved_mode)
     traces.activate_session(session.session_id)
     traces.emit(
         TraceEvent(
             session_id=session.session_id,
             type="session",
             message="App session created for chained voice pipeline",
-            data={"mode": "stt_llm_tts", "response_mode": response_mode},
+            data={"mode": "stt_llm_tts", "response_mode": session.response_mode},
         )
     )
     return PipelineSessionResponse(
         session_id=session.session_id,
-        response_mode=response_mode,
+        response_mode=session.response_mode,
         pipeline_mode="stt_llm_tts",
     )
 
@@ -306,6 +445,320 @@ async def run_pipeline_turn(
     )
 
 
+@app.post("/pipeline/turn/stream")
+async def run_pipeline_turn_stream(
+    session_id: str = Form(...),
+    turn_id: str = Form(...),
+    audio_duration_ms: float | None = Form(None),
+    audio: UploadFile = File(...),
+) -> StreamingResponse:
+    backend_started_at = time.perf_counter()
+    try:
+        session = conversations.get_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown session_id")
+
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio")
+
+    content_type = audio.content_type or "audio/webm"
+    expected_field = expected_information_field(session)
+    try:
+        transcript, stt_ms = stt.transcribe_with_timing(
+            audio_bytes,
+            content_type=content_type,
+            expected_field=expected_field,
+        )
+    except stt.SpeechToTextError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    measured_duration_seconds = (
+        max(0.0, audio_duration_ms / 1000.0)
+        if audio_duration_ms is not None and audio_duration_ms > 0
+        else None
+    )
+    audio_duration_seconds = (
+        stt.wav_duration_seconds(audio_bytes, content_type=content_type)
+        or measured_duration_seconds
+    )
+    if transcript and stt.transcript_is_implausible(
+        transcript,
+        audio_duration_seconds=audio_duration_seconds,
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="STT result was rejected because it could not plausibly fit in the captured audio.",
+        )
+    if not transcript and not expected_field:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "STT received the audio but found no speech "
+                f"({len(audio_bytes)} bytes, {content_type})."
+            ),
+        )
+
+    if transcript:
+        traces.emit(
+            TraceEvent(
+                session_id=session.session_id,
+                type="user_transcript",
+                message="User transcript received",
+                data={"text": transcript},
+            )
+        )
+    else:
+        traces.emit(
+            TraceEvent(
+                session_id=session.session_id,
+                type="recognition_repair",
+                message="Expected information was not recognized",
+                data={"expected_field": expected_field},
+            )
+        )
+
+    try:
+        if transcript:
+            agent_result = pipeline_agent.handle_text(session=session, text=transcript)
+        else:
+            agent_result = pipeline_agent.handle_unrecognized_capture(
+                session=session,
+                expected_field=expected_field,
+            )
+    except (PipelineAgentConfigError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    response_text = agent_result["response_text"]
+    traces.emit(
+        TraceEvent(
+            session_id=session.session_id,
+            type="assistant_transcript",
+            message="Assistant response generated",
+            data={
+                "text": response_text,
+                "response_mode": agent_result["response_mode"],
+                "has_tool_call": agent_result["has_tool_call"],
+                "tool_result": agent_result["tool_result"],
+                "tool_calls": agent_result["tool_calls"],
+            },
+        )
+    )
+
+    def generate() -> Iterator[bytes]:
+        tts_ttf_audio_ms: float | None = None
+        tts_total_ms: float | None = None
+        yield _stream_event(
+            "metadata",
+            {
+                "session_id": session.session_id,
+                "turn_id": turn_id,
+                "transcript": transcript or "",
+                "response_text": response_text,
+                "response_mode": agent_result["response_mode"],
+                "has_tool_call": agent_result["has_tool_call"],
+                "audio_media_type": "audio/mpeg",
+                "tool_result": agent_result["tool_result"],
+                "tool_calls": agent_result["tool_calls"],
+                "metrics": {
+                    "stt_ms": stt_ms,
+                    "llm_ttft_ms": agent_result["llm_ttft_ms"],
+                    "llm_total_ms": agent_result["llm_total_ms"],
+                    "tool_round_trip_ms": agent_result["tool_round_trip_ms"],
+                },
+            },
+        )
+
+        try:
+            saw_audio = False
+            for chunk, first_audio_ms, total_ms in tts.stream_with_timing(response_text):
+                if first_audio_ms is not None:
+                    tts_ttf_audio_ms = first_audio_ms
+                if total_ms is not None:
+                    tts_total_ms = total_ms
+                    continue
+                if not chunk:
+                    continue
+                saw_audio = True
+                yield _stream_event(
+                    "audio",
+                    {
+                        "audio_base64": base64.b64encode(chunk).decode("ascii"),
+                        "tts_ttf_audio_ms": first_audio_ms,
+                    },
+                )
+
+            if not saw_audio:
+                yield _stream_event("error", {"detail": "TTS synthesis failed"})
+                return
+
+            backend_processing_ms = round((time.perf_counter() - backend_started_at) * 1000, 1)
+            stage_total_ms = sum(
+                value or 0
+                for value in (
+                    stt_ms,
+                    agent_result["llm_total_ms"],
+                    agent_result["tool_round_trip_ms"],
+                    tts_total_ms,
+                )
+            )
+            yield _stream_event(
+                "done",
+                {
+                    "metrics": {
+                        "stt_ms": stt_ms,
+                        "llm_ttft_ms": agent_result["llm_ttft_ms"],
+                        "llm_total_ms": agent_result["llm_total_ms"],
+                        "tool_round_trip_ms": agent_result["tool_round_trip_ms"],
+                        "tts_ttf_audio_ms": tts_ttf_audio_ms,
+                        "tts_total_ms": tts_total_ms,
+                        "backend_processing_ms": backend_processing_ms,
+                        "backend_other_ms": round(max(0, backend_processing_ms - stage_total_ms), 1),
+                    },
+                },
+            )
+        except Exception as exc:
+            yield _stream_event("error", {"detail": f"TTS streaming failed: {exc}"})
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
+@app.websocket("/pipeline/ws")
+async def pipeline_websocket(websocket: WebSocket, response_mode: str | None = Query(None)) -> None:
+    await websocket.accept()
+    try:
+        resolved_mode = _resolve_response_mode(response_mode)
+    except ValueError as exc:
+        await websocket.send_json({"event": "error", "detail": str(exc)})
+        await websocket.close(code=1008)
+        return
+
+    session = conversations.create_session(response_mode=resolved_mode)
+    traces.activate_session(session.session_id)
+    traces.emit(
+        TraceEvent(
+            session_id=session.session_id,
+            type="session",
+            message="WebSocket streaming pipeline session created",
+            data={"mode": "streaming_ws", "response_mode": session.response_mode},
+        )
+    )
+    await websocket.send_json(
+        {
+            "event": "session",
+            "session_id": session.session_id,
+            "response_mode": session.response_mode,
+            "pipeline_mode": "streaming_ws",
+        }
+    )
+
+    try:
+        while True:
+            message = await websocket.receive_json()
+            if message.get("event") == "close":
+                break
+            if message.get("event") != "turn_audio":
+                await websocket.send_json({"event": "error", "detail": "Unsupported websocket event"})
+                continue
+
+            backend_started_at = time.perf_counter()
+            turn_id = str(message.get("turn_id") or "")
+            audio_base64 = message.get("audio_base64") or ""
+            content_type = message.get("content_type") or "audio/wav"
+            audio_duration_ms = message.get("audio_duration_ms")
+            if not turn_id:
+                await websocket.send_json({"event": "error", "detail": "Missing turn_id"})
+                continue
+            try:
+                audio_bytes = base64.b64decode(audio_base64)
+                current_session, transcript, agent_result, stt_ms = _process_pipeline_audio(
+                    session_id=session.session_id,
+                    turn_id=turn_id,
+                    audio_bytes=audio_bytes,
+                    content_type=content_type,
+                    audio_duration_ms=float(audio_duration_ms) if audio_duration_ms else None,
+                )
+            except HTTPException as exc:
+                await websocket.send_json({"event": "error", "turn_id": turn_id, "detail": exc.detail})
+                continue
+            except Exception as exc:
+                await websocket.send_json({"event": "error", "turn_id": turn_id, "detail": str(exc)})
+                continue
+
+            await websocket.send_json(
+                {
+                    "event": "metadata",
+                    **_pipeline_metadata_payload(
+                        session=current_session,
+                        turn_id=turn_id,
+                        transcript=transcript,
+                        agent_result=agent_result,
+                        stt_ms=stt_ms,
+                    ),
+                }
+            )
+
+            tts_ttf_audio_ms: float | None = None
+            tts_total_ms: float | None = None
+            saw_audio = False
+            try:
+                for chunk, first_audio_ms, total_ms in tts.stream_with_timing(agent_result["response_text"]):
+                    if first_audio_ms is not None:
+                        tts_ttf_audio_ms = first_audio_ms
+                    if total_ms is not None:
+                        tts_total_ms = total_ms
+                        continue
+                    if not chunk:
+                        continue
+                    saw_audio = True
+                    await websocket.send_json(
+                        {
+                            "event": "audio",
+                            "turn_id": turn_id,
+                            "audio_base64": base64.b64encode(chunk).decode("ascii"),
+                            "tts_ttf_audio_ms": first_audio_ms,
+                        }
+                    )
+                if not saw_audio:
+                    await websocket.send_json({"event": "error", "turn_id": turn_id, "detail": "TTS synthesis failed"})
+                    continue
+            except Exception as exc:
+                await websocket.send_json({"event": "error", "turn_id": turn_id, "detail": f"TTS streaming failed: {exc}"})
+                continue
+
+            backend_processing_ms = round((time.perf_counter() - backend_started_at) * 1000, 1)
+            stage_total_ms = sum(
+                value or 0
+                for value in (
+                    stt_ms,
+                    agent_result["llm_total_ms"],
+                    agent_result["tool_round_trip_ms"],
+                    tts_total_ms,
+                )
+            )
+            await websocket.send_json(
+                {
+                    "event": "done",
+                    "turn_id": turn_id,
+                    "metrics": {
+                        "stt_ms": stt_ms,
+                        "llm_ttft_ms": agent_result["llm_ttft_ms"],
+                        "llm_total_ms": agent_result["llm_total_ms"],
+                        "tool_round_trip_ms": agent_result["tool_round_trip_ms"],
+                        "tts_ttf_audio_ms": tts_ttf_audio_ms,
+                        "tts_total_ms": tts_total_ms,
+                        "backend_processing_ms": backend_processing_ms,
+                        "backend_other_ms": round(max(0, backend_processing_ms - stage_total_ms), 1),
+                    },
+                }
+            )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        conversations.delete_session(session.session_id)
+        traces.clear_session(session.session_id)
+
+
 @app.post("/latency/turn", status_code=201)
 def record_latency(sample: LatencySample) -> dict:
     try:
@@ -341,26 +794,23 @@ def export_latency_csv() -> Response:
     )
 
 
-# CURRENT APPROACH:
-# The frontend will ask for a short-lived Realtime client secret, then connect
-# directly to OpenAI over WebRTC for low-latency voice input/output.
-#
-# OLD APPROACH:
-# The backend directly handled /stt -> /chat -> /tts in separate REST calls.
-# We are keeping that older path below during the migration.
+# LEGACY APPROACH:
+# The frontend requests a short-lived Realtime client secret, then connects
+# directly to OpenAI over WebRTC. It remains available only as a comparison
+# mode; the primary implementation is the explicit STT -> LLM -> TTS pipeline.
 @app.post("/realtime/session", response_model=RealtimeSessionResponse)
-def create_realtime_session() -> RealtimeSessionResponse:
+def create_realtime_session(response_mode: str | None = Query(None)) -> RealtimeSessionResponse:
     try:
         realtime = create_realtime_client_secret()
     except RealtimeConfigError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
     try:
-        response_mode = get_response_mode()
+        resolved_mode = _resolve_response_mode(response_mode)
     except ValueError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
 
-    app_session = conversations.create_session()
+    app_session = conversations.create_session(response_mode=resolved_mode)
     traces.activate_session(app_session.session_id)
 
     traces.emit(
@@ -368,7 +818,7 @@ def create_realtime_session() -> RealtimeSessionResponse:
             session_id=app_session.session_id,
             type="session",
             message="App session created for realtime conversation",
-            data={"mode": "realtime_webrtc", "response_mode": response_mode},
+            data={"mode": "realtime_webrtc", "response_mode": app_session.response_mode},
         )
     )
     traces.emit(
@@ -392,7 +842,7 @@ def create_realtime_session() -> RealtimeSessionResponse:
         client_secret=realtime["client_secret"]["value"],
         expires_at=realtime["expires_at"],
         realtime_session=realtime["session"],
-        response_mode=response_mode,
+        response_mode=app_session.response_mode,
     )
 
 

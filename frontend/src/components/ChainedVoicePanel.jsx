@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  backendWebSocketUrl,
   createPipelineSession,
   deleteSession,
   getLatencySummary,
@@ -40,6 +41,87 @@ function base64ToBlob(base64, mediaType) {
     bytes[index] = raw.charCodeAt(index);
   }
   return new Blob([bytes], { type: mediaType });
+}
+
+function base64ToBytes(base64) {
+  const raw = atob(base64);
+  const bytes = new Uint8Array(raw.length);
+  for (let index = 0; index < raw.length; index += 1) {
+    bytes[index] = raw.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      resolve(result.includes(',') ? result.split(',', 2)[1] : result);
+    };
+    reader.onerror = () => reject(reader.error || new Error('Could not read audio blob'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function createStreamingAudioPlayer(mediaType = 'audio/mpeg') {
+  const MediaSourceClass = window.MediaSource || window.WebKitMediaSource;
+  const supported = MediaSourceClass
+    && (!MediaSourceClass.isTypeSupported || MediaSourceClass.isTypeSupported(mediaType));
+  if (!supported) return null;
+
+  const mediaSource = new MediaSourceClass();
+  const audioUrl = URL.createObjectURL(mediaSource);
+  const audio = new Audio(audioUrl);
+  const queue = [];
+  let sourceBuffer = null;
+  let ended = false;
+  let failed = false;
+  let resolveReady;
+  let rejectReady;
+  const ready = new Promise((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+
+  const pump = () => {
+    if (!sourceBuffer || sourceBuffer.updating || failed) return;
+    if (queue.length > 0) {
+      sourceBuffer.appendBuffer(queue.shift());
+      return;
+    }
+    if (ended && mediaSource.readyState === 'open') {
+      mediaSource.endOfStream();
+    }
+  };
+
+  mediaSource.addEventListener('sourceopen', () => {
+    try {
+      sourceBuffer = mediaSource.addSourceBuffer(mediaType);
+      sourceBuffer.mode = 'sequence';
+      sourceBuffer.addEventListener('updateend', pump);
+      resolveReady();
+      pump();
+    } catch (error) {
+      failed = true;
+      rejectReady(error);
+    }
+  }, { once: true });
+
+  return {
+    audio,
+    audioUrl,
+    async append(bytes) {
+      await ready;
+      queue.push(bytes);
+      pump();
+    },
+    async end() {
+      await ready;
+      ended = true;
+      pump();
+    },
+  };
 }
 
 function encodeWav(chunks, sampleRate) {
@@ -144,6 +226,8 @@ function normalizeToolCalls(result) {
 export default function ChainedVoicePanel({
   sessionId,
   resetToken = 0,
+  transportMode = 'pipeline',
+  responseMode = 'speech_directive',
   onSessionChange,
   onError,
   controls,
@@ -167,6 +251,8 @@ export default function ChainedVoicePanel({
   const connectAttemptRef = useRef(0);
   const cleanupPromiseRef = useRef(Promise.resolve());
   const playbackRef = useRef(null);
+  const websocketRef = useRef(null);
+  const pendingStreamTurnRef = useRef(null);
   const busyRef = useRef(false);
   const statusRef = useRef('idle');
   const agentSpeakingRef = useRef(false);
@@ -222,6 +308,11 @@ export default function ChainedVoicePanel({
       audio.load();
       URL.revokeObjectURL(audioUrl);
     }
+    if (websocketRef.current) {
+      websocketRef.current.close();
+      websocketRef.current = null;
+    }
+    pendingStreamTurnRef.current = null;
     void cleanupBackendSession(staleSessionId);
     onSessionChange?.('');
     setPipelineMeta(null);
@@ -244,74 +335,169 @@ export default function ChainedVoicePanel({
     setStatus('thinking');
     try {
       const pipelineStartedAt = performance.now();
-      const result = await runPipelineTurn(
-        activeSessionId,
-        turn.turnId,
-        audioBlob,
-        turn.audioDurationMs,
-      );
-      const pipelineCompletedAt = performance.now();
-      if (!mountedRef.current || sessionIdRef.current !== activeSessionId) return;
-      const audioBlobOut = base64ToBlob(result.audio_base64, result.audio_media_type);
-      const audioUrl = URL.createObjectURL(audioBlobOut);
-      const audio = new Audio(audioUrl);
-      playbackRef.current = { audio, audioUrl };
-      const audioPreparedAt = performance.now();
+      let result = null;
+      let doneEvent = null;
+      let pipelineCompletedAt = null;
+      let firstAudioChunkAt = null;
+      let audioPreparedAt = null;
+      let playbackRequestedAt = null;
+      let heardPromise = null;
+      let playStarted = false;
+      let streamPlayer = null;
+      let incrementalPlayback = false;
+      const fallbackChunks = [];
+      let fallbackMediaType = 'audio/mpeg';
 
-      setConversationMessages((previous) => [
-        ...previous,
-        ...(result.transcript ? [{
-          id: `${result.turn_id}-user`,
-          role: 'user',
-          text: result.transcript,
-        }] : []),
-        {
-          id: `${result.turn_id}-assistant`,
-          role: 'assistant',
-          text: result.response_text,
-          tool_calls: normalizeToolCalls(result),
-        },
-      ]);
-      setIsAgentSpeaking(true);
-      setStatus('speaking');
+      const startPlayback = async (audio, audioUrl) => {
+        if (playStarted) return;
+        playStarted = true;
+        playbackRef.current = { audio, audioUrl };
+        setIsAgentSpeaking(true);
+        setStatus('speaking');
+        heardPromise = new Promise((resolve) => {
+          let resolved = false;
+          const resolveOnce = () => {
+            if (resolved) return;
+            resolved = true;
+            resolve(performance.now());
+          };
+          audio.addEventListener('playing', resolveOnce, { once: true });
+          audio.addEventListener('timeupdate', resolveOnce, { once: true });
+        });
+        audio.addEventListener('ended', () => {
+          URL.revokeObjectURL(audioUrl);
+          if (playbackRef.current?.audio !== audio) return;
+          playbackRef.current = null;
+          setIsAgentSpeaking(false);
+          busyRef.current = false;
+          if (mountedRef.current) setStatus('listening');
+        }, { once: true });
+        audio.addEventListener('error', () => {
+          URL.revokeObjectURL(audioUrl);
+          if (playbackRef.current?.audio !== audio) return;
+          playbackRef.current = null;
+          setIsAgentSpeaking(false);
+          busyRef.current = false;
+          setStatus('listening');
+          onError?.('Audio playback failed');
+        }, { once: true });
+        playbackRequestedAt = performance.now();
+        await audio.play();
+      };
 
-      const heardPromise = new Promise((resolve) => {
-        let resolved = false;
-        const resolveOnce = () => {
-          if (resolved) return;
-          resolved = true;
-          resolve(performance.now());
-        };
-        audio.addEventListener('playing', resolveOnce, { once: true });
-        audio.addEventListener('timeupdate', resolveOnce, { once: true });
-      });
+      const streamHandlers = {
+        onMetadata: async (event) => {
+            if (!mountedRef.current || sessionIdRef.current !== activeSessionId) return;
+            result = event;
+            fallbackMediaType = event.audio_media_type || 'audio/mpeg';
+            setConversationMessages((previous) => [
+              ...previous,
+              ...(event.transcript ? [{
+                id: `${event.turn_id}-user`,
+                role: 'user',
+                text: event.transcript,
+              }] : []),
+              {
+                id: `${event.turn_id}-assistant`,
+                role: 'assistant',
+                text: event.response_text,
+                tool_calls: normalizeToolCalls(event),
+              },
+            ]);
+          },
+        onAudio: async (event) => {
+            if (!mountedRef.current || sessionIdRef.current !== activeSessionId) return;
+            const bytes = base64ToBytes(event.audio_base64);
+            if (!firstAudioChunkAt) firstAudioChunkAt = performance.now();
+            if (!streamPlayer) {
+              streamPlayer = createStreamingAudioPlayer(fallbackMediaType);
+              audioPreparedAt = performance.now();
+            }
+            if (streamPlayer) {
+              incrementalPlayback = true;
+              await streamPlayer.append(bytes);
+              await startPlayback(streamPlayer.audio, streamPlayer.audioUrl);
+            } else {
+              fallbackChunks.push(bytes);
+            }
+          },
+        onDone: async (event) => {
+            doneEvent = event;
+          },
+      };
 
-      audio.addEventListener('ended', () => {
-        URL.revokeObjectURL(audioUrl);
-        if (playbackRef.current?.audio !== audio) return;
-        playbackRef.current = null;
-        setIsAgentSpeaking(false);
-        busyRef.current = false;
-        if (mountedRef.current) setStatus('listening');
-      }, { once: true });
-      audio.addEventListener('error', () => {
-        URL.revokeObjectURL(audioUrl);
-        if (playbackRef.current?.audio !== audio) return;
-        playbackRef.current = null;
-        setIsAgentSpeaking(false);
-        busyRef.current = false;
-        setStatus('listening');
-        onError?.('Audio playback failed');
-      }, { once: true });
+      if (transportMode === 'pipeline') {
+        // Baseline mode deliberately waits for the completed STT -> LLM -> TTS
+        // request. This is the comparison point for the persistent WebSocket
+        // streaming transport below.
+        const event = await runPipelineTurn(
+          activeSessionId,
+          turn.turnId,
+          audioBlob,
+          turn.audioDurationMs,
+        );
+        await streamHandlers.onMetadata(event);
+        fallbackChunks.push(base64ToBytes(event.audio_base64));
+        await streamHandlers.onDone(event);
+      } else if (transportMode === 'streaming') {
+        const socket = websocketRef.current;
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          throw new Error('Streaming socket is not connected.');
+        }
+        await new Promise((resolve, reject) => {
+          pendingStreamTurnRef.current = {
+            turnId: turn.turnId,
+            handlers: streamHandlers,
+            resolve,
+            reject,
+          };
+          blobToBase64(audioBlob)
+            .then((audioBase64) => {
+              socket.send(JSON.stringify({
+                event: 'turn_audio',
+                turn_id: turn.turnId,
+                content_type: audioBlob.type || 'audio/wav',
+                audio_duration_ms: turn.audioDurationMs,
+                audio_base64: audioBase64,
+              }));
+            })
+            .catch((error) => {
+              pendingStreamTurnRef.current = null;
+              reject(error);
+            });
+        });
+      } else {
+        throw new Error(`Unsupported pipeline transport: ${transportMode}`);
+      }
+      pipelineCompletedAt = performance.now();
 
-      const playbackRequestedAt = performance.now();
-      await audio.play();
-      const heardAt = await heardPromise;
-      const metrics = result.metrics || {};
+      if (!mountedRef.current || sessionIdRef.current !== activeSessionId || !result) return;
+
+      if (streamPlayer) {
+        await streamPlayer.end();
+      } else if (fallbackChunks.length > 0) {
+        const audioBlobOut = new Blob(fallbackChunks, { type: fallbackMediaType });
+        const audioUrl = URL.createObjectURL(audioBlobOut);
+        const audio = new Audio(audioUrl);
+        audioPreparedAt = performance.now();
+        await startPlayback(audio, audioUrl);
+      }
+
+      const heardAt = heardPromise ? await heardPromise : pipelineCompletedAt;
+      const metrics = { ...(result.metrics || {}), ...((doneEvent && doneEvent.metrics) || {}) };
       const pipelineRoundTripMs = duration(pipelineStartedAt, pipelineCompletedAt) || 0;
-      const backendProcessingMs = Number(metrics.backend_processing_ms) || 0;
-      const transportSerializationMs = Math.max(0, Math.round((pipelineRoundTripMs - backendProcessingMs) * 10) / 10);
-      const responsePrepareMs = duration(pipelineCompletedAt, audioPreparedAt) || 0;
+      const firstAudioBackendMs = [
+        metrics.stt_ms,
+        metrics.llm_total_ms,
+        metrics.tool_round_trip_ms,
+        metrics.tts_ttf_audio_ms,
+      ].reduce((total, value) => total + (Number(value) || 0), 0);
+      const firstAudioElapsedMs = duration(pipelineStartedAt, firstAudioChunkAt || pipelineCompletedAt) || 0;
+      const transportSerializationMs = Math.max(
+        0,
+        Math.round((firstAudioElapsedMs - firstAudioBackendMs) * 10) / 10,
+      );
+      const responsePrepareMs = duration(firstAudioChunkAt, audioPreparedAt) || 0;
       const playbackStartMs = duration(playbackRequestedAt, heardAt) || 0;
       const audioEncodingMs = Number(turn.audioEncodingMs) || 0;
       const deliveryOverheadMs = Math.round(
@@ -323,7 +509,10 @@ export default function ChainedVoicePanel({
         response_mode: result.response_mode,
         has_tool_call: Boolean(result.has_tool_call),
         transcript: result.transcript || null,
-        measurement_source: 'first_audio_event',
+        agent_response: result.response_text || null,
+        measurement_source: incrementalPlayback
+          ? 'streamed_first_audio'
+          : 'buffered_complete_audio',
         end_of_speech_detection_ms: duration(turn.localSpeechEndAt, turn.turnDetectedAt) || 0,
         stt_ms: metrics.stt_ms,
         llm_ttft_ms: metrics.llm_ttft_ms,
@@ -343,7 +532,7 @@ export default function ChainedVoicePanel({
         voiced_ratio: turn.voicedRatio,
         peak_rms: turn.peakRms,
         vad_threshold: turn.vadThreshold,
-        total_to_first_audio_ms: duration(turn.localSpeechEndAt, heardAt) || duration(turn.localSpeechEndAt, pipelineCompletedAt) || 0,
+        total_to_first_audio_ms: duration(turn.localSpeechEndAt, heardAt) || firstAudioElapsedMs,
         tool_round_trip_ms: metrics.tool_round_trip_ms,
       });
     } catch (error) {
@@ -353,7 +542,7 @@ export default function ChainedVoicePanel({
       setStatus('listening');
       onError?.(error.message || 'Pipeline turn failed');
     }
-  }, [onError, submitLatency]);
+  }, [onError, submitLatency, transportMode]);
 
   const handleAudioFrame = useCallback((samples, sampleRate, rms, now) => {
     const liveStatus = statusRef.current;
@@ -455,9 +644,69 @@ export default function ChainedVoicePanel({
     try {
       await cleanupPromiseRef.current;
       if (!mountedRef.current || connectAttemptRef.current !== attemptId) return;
-      const meta = await createPipelineSession();
+      let meta;
+      let streamingSocket = null;
+      if (transportMode === 'streaming') {
+        const socket = new WebSocket(backendWebSocketUrl('/pipeline/ws', responseMode));
+        streamingSocket = socket;
+        meta = await new Promise((resolve, reject) => {
+          const timeoutId = window.setTimeout(() => {
+            reject(new Error('Streaming socket connection timed out'));
+          }, 10000);
+          socket.onmessage = async (message) => {
+            try {
+              const event = JSON.parse(message.data);
+              if (event.event === 'session') {
+                window.clearTimeout(timeoutId);
+                resolve({
+                  session_id: event.session_id,
+                  response_mode: event.response_mode,
+                  pipeline_mode: event.pipeline_mode,
+                });
+                return;
+              }
+              const pending = pendingStreamTurnRef.current;
+              if (!pending) return;
+              if (event.turn_id && event.turn_id !== pending.turnId) return;
+              if (event.event === 'metadata') {
+                await pending.handlers.onMetadata?.(event);
+              } else if (event.event === 'audio') {
+                await pending.handlers.onAudio?.(event);
+              } else if (event.event === 'done') {
+                await pending.handlers.onDone?.(event);
+                pendingStreamTurnRef.current = null;
+                pending.resolve(event);
+              } else if (event.event === 'error') {
+                pendingStreamTurnRef.current = null;
+                pending.reject(new Error(event.detail || 'Streaming pipeline failed'));
+              }
+            } catch (error) {
+              const pending = pendingStreamTurnRef.current;
+              if (pending) {
+                pendingStreamTurnRef.current = null;
+                pending.reject(error);
+              }
+            }
+          };
+          socket.onerror = () => {
+            window.clearTimeout(timeoutId);
+            reject(new Error('Streaming socket failed to connect'));
+          };
+          socket.onclose = () => {
+            const pending = pendingStreamTurnRef.current;
+            if (pending) {
+              pendingStreamTurnRef.current = null;
+              pending.reject(new Error('Streaming socket closed'));
+            }
+          };
+        });
+        websocketRef.current = socket;
+      } else {
+        meta = await createPipelineSession(responseMode);
+      }
       if (!mountedRef.current || connectAttemptRef.current !== attemptId) {
-        void cleanupBackendSession(meta.session_id);
+        if (transportMode === 'streaming') (streamingSocket || websocketRef.current)?.close();
+        else void cleanupBackendSession(meta.session_id);
         return;
       }
       sessionIdRef.current = meta.session_id;
@@ -480,7 +729,7 @@ export default function ChainedVoicePanel({
       setStatus('error');
       onError?.(error.message || 'Pipeline connection failed');
     }
-  }, [cleanupBackendSession, disconnect, handleAudioFrame, onError, onSessionChange]);
+  }, [cleanupBackendSession, disconnect, handleAudioFrame, onError, onSessionChange, responseMode, transportMode]);
 
   useEffect(() => {
     mountedRef.current = true;

@@ -2494,8 +2494,9 @@ button:focus-visible {
   padding: 4px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 6px;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 5px;
   border: 1px solid rgba(147, 197, 253, 0.24);
   border-radius: 12px;
   background: rgba(239, 247, 255, 0.78);
@@ -2508,7 +2509,7 @@ button:focus-visible {
 }
 
 .embedded-mode-switch button {
-  padding: 5px 9px;
+  padding: 5px 7px;
   border: 0;
   border-radius: 8px;
   color: #6d86a8;
@@ -2516,6 +2517,11 @@ button:focus-visible {
   cursor: pointer;
   font-size: 0.53rem;
   font-weight: 800;
+}
+
+.embedded-response-switch {
+  padding-left: 5px;
+  border-left: 1px solid rgba(147, 197, 253, 0.34);
 }
 
 .embedded-mode-switch button.active {

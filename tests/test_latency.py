@@ -22,6 +22,17 @@ def sample(turn_id: str, mode: str, total_ms: float, *, has_tool_call: bool = Fa
     )
 
 
+def sample_with_source(turn_id: str, source: str) -> LatencySample:
+    return LatencySample(
+        turn_id=turn_id,
+        session_id="session-1",
+        response_mode="speech_directive",
+        measurement_source=source,
+        end_of_speech_detection_ms=500,
+        total_to_first_audio_ms=700,
+    )
+
+
 class LatencyStoreTest(unittest.TestCase):
     def test_summarizes_median_and_nearest_rank_p95_by_mode(self) -> None:
         store = LatencyStore()
@@ -61,6 +72,11 @@ class LatencyStoreTest(unittest.TestCase):
         self.assertEqual(llm["tool_count"], 1)
         self.assertEqual(llm["metrics"]["total_to_first_audio_ms"]["median_ms"], 500)
         self.assertEqual(llm["tool_metrics"]["total_to_first_audio_ms"]["median_ms"], 900)
+
+    def test_accepts_pipeline_streaming_measurement_sources(self) -> None:
+        store = LatencyStore()
+        self.assertTrue(store.add(sample_with_source("streamed", "streamed_first_audio")))
+        self.assertTrue(store.add(sample_with_source("buffered", "buffered_complete_audio")))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ const METRICS = [
   ['llm_total_ms', 'Model response', 'LLM'],
   ['tool_round_trip_ms', 'Local tool chain', 'TOOL'],
   ['tts_ttf_audio_ms', 'First audio', 'TTS'],
-  ['tts_total_ms', 'Complete synthesis', 'TTSΣ'],
+  ['tts_total_ms', 'Full synthesis', 'TTSΣ'],
   ['delivery_overhead_ms', 'Browser and delivery', 'I/O'],
 ];
 
@@ -18,6 +18,7 @@ function formatSeconds(value) {
 
 export default function LatencyPanel({ turns = [], summary, activeMode, status }) {
   const latest = turns[0];
+  const streamedPlayback = latest?.measurement_source === 'streamed_first_audio';
   const modeSummary = summary?.by_mode?.[activeMode];
   const benchmarkCount = modeSummary?.count || 0;
   const maxStage = Math.max(
@@ -53,12 +54,15 @@ export default function LatencyPanel({ turns = [], summary, activeMode, status }
         {METRICS.map(([key, label, code]) => {
           const value = latest?.[key];
           const width = value == null ? 0 : Math.max(5, (value / maxStage) * 100);
+          const displayLabel = key === 'tts_total_ms' && streamedPlayback
+            ? 'Full synthesis (background)'
+            : label;
           return (
             <div className="pipeline-row" key={key}>
               <span className="pipeline-code">{code}</span>
               <div className="pipeline-stage">
                 <div className="pipeline-stage-copy">
-                  <span>{label}</span>
+                  <span>{displayLabel}</span>
                   <strong>{formatSeconds(value)}</strong>
                 </div>
                 <div className="pipeline-track">
@@ -71,7 +75,11 @@ export default function LatencyPanel({ turns = [], summary, activeMode, status }
       </div>
 
       <div className="analytics-footer">
-        <span>Values are measured in-browser per completed turn.</span>
+        <span>
+          {streamedPlayback
+            ? 'End-to-heard uses first audio; synthesis continues in the background.'
+            : 'Values are measured in-browser per completed turn.'}
+        </span>
         <button type="button" onClick={() => void downloadLatencyCsv()}>Export CSV</button>
       </div>
     </aside>

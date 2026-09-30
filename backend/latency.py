@@ -17,7 +17,13 @@ class LatencySample(BaseModel):
     response_mode: Literal["llm", "speech_directive"]
     has_tool_call: bool = False
     transcript: Optional[str] = None
-    measurement_source: Literal["output_energy", "first_audio_event"] = "first_audio_event"
+    agent_response: Optional[str] = None
+    measurement_source: Literal[
+        "output_energy",
+        "first_audio_event",
+        "streamed_first_audio",
+        "buffered_complete_audio",
+    ] = "first_audio_event"
     end_of_speech_detection_ms: float = Field(ge=0)
     stt_ms: Optional[float] = Field(default=None, ge=0)
     llm_ttft_ms: Optional[float] = Field(default=None, ge=0)

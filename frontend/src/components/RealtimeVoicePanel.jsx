@@ -674,14 +674,14 @@ export default function RealtimeVoicePanel({
   const conversationMessages = eventLog.flatMap((event, index) => {
     if (event.type === 'user_transcript') {
       return [{
-        id: `legacy-user-${event.ts}-${index}`,
+        id: `realtime-user-${event.ts}-${index}`,
         role: 'user',
         text: event.data?.text || '',
       }];
     }
     if (event.type === 'tool_exchange') {
       return [{
-        id: `legacy-tools-${event.ts}-${index}`,
+        id: `realtime-tools-${event.ts}-${index}`,
         role: 'assistant',
         text: '',
         tool_calls: event.data?.tool_calls || [],
@@ -689,14 +689,13 @@ export default function RealtimeVoicePanel({
     }
     if (event.type === 'assistant_transcript') {
       return [{
-        id: `legacy-assistant-${event.ts}-${index}`,
+        id: `realtime-assistant-${event.ts}-${index}`,
         role: 'assistant',
         text: event.data?.text || '',
       }];
     }
     return [];
   });
-
   const activityCopy = {
     idle: ['Ready when you are', 'Start a call to begin the latency run.'],
     connecting: ['Opening the channel', 'Securing a low-latency WebRTC connection…'],
@@ -779,112 +778,6 @@ export default function RealtimeVoicePanel({
       </section>
 
       <DemoDataPanel open={demoDataOpen} onClose={() => setDemoDataOpen(false)} />
-
-      <section className="call-stage" hidden aria-hidden="true">
-        <div className="call-stage-header">
-          <div>
-            <div className="stage-eyebrow">Live customer success call</div>
-            <h1>Talk with Mira</h1>
-          </div>
-          <div className="session-cluster">
-            {controls}
-            <span className={`connection-pill ${status}`}>
-              <span className="connection-dot" />
-              {status === 'connected' ? 'Live' : status}
-            </span>
-            <span className="session-id">
-              {sessionId ? `Session ${sessionId.slice(0, 8)}` : 'No active session'}
-            </span>
-          </div>
-        </div>
-
-        <div className="call-center">
-          <div className="participant-label caller-label">
-            <span className={`participant-signal ${isUserSpeaking ? 'active' : ''}`} />
-            <span>
-              <strong>You</strong>
-              <small>{isUserSpeaking ? 'Speaking' : 'Caller'}</small>
-            </span>
-          </div>
-
-          <div className={`orb-system ${activityState}`}>
-            <div className="orb-ring orb-ring-one" />
-            <div className="orb-ring orb-ring-two" />
-            <div className="orb-ring orb-ring-three" />
-            <div className="orb-track">
-              <span className="orb-satellite" />
-            </div>
-            <div className="call-orb">
-              <div className="orb-glow" />
-              <div className="voice-bars" aria-hidden="true">
-                {[0, 1, 2, 3, 4].map((bar) => <span key={bar} />)}
-              </div>
-              <span className="orb-monogram">M</span>
-            </div>
-          </div>
-
-          <div className="participant-label mira-label">
-            <span className={`participant-signal mira ${isAgentSpeaking ? 'active' : ''}`} />
-            <span>
-              <strong>Mira</strong>
-              <small>{isAgentSpeaking ? 'Speaking' : 'AI agent'}</small>
-            </span>
-          </div>
-        </div>
-
-        <div className="call-state-copy" aria-live="polite">
-          <h2>{activityTitle}</h2>
-          <p>{activitySubtitle}</p>
-        </div>
-
-        <button
-          type="button"
-          onClick={callActive ? disconnect : connect}
-          className={`call-control ${callActive ? 'hangup' : 'start'}`}
-          disabled={status === 'connecting'}
-        >
-          <span className="call-control-icon" aria-hidden="true">
-            {callActive ? (
-              <svg viewBox="0 0 24 24"><path d="M6.6 10.8c3.6-2.4 7.2-2.4 10.8 0l-1.6 3.1c-.2.4-.7.6-1.1.4l-2-1a1.7 1.7 0 0 0-1.4 0l-2 1c-.4.2-.9 0-1.1-.4l-1.6-3.1Z" /></svg>
-            ) : (
-              <svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 0 0 3.5-3.5V5a3.5 3.5 0 1 0-7 0v7a3.5 3.5 0 0 0 3.5 3.5Zm6-3.5a1 1 0 1 0-2 0 4 4 0 0 1-8 0 1 1 0 1 0-2 0 6 6 0 0 0 5 5.91V20H8.5a1 1 0 1 0 0 2h7a1 1 0 1 0 0-2H13v-2.09A6 6 0 0 0 18 12Z" /></svg>
-            )}
-          </span>
-          <span>
-            <strong>{status === 'connecting' ? 'Connecting…' : callActive ? 'End call' : 'Start live call'}</strong>
-            <small>{callActive ? 'Close the realtime session' : 'Microphone access required'}</small>
-          </span>
-        </button>
-
-        <div className="conversation-glance">
-          <div className="glance-card caller">
-            <span className="glance-label">Latest from you</span>
-            <p>{latestUserTranscript || 'Your transcript will appear here while you speak.'}</p>
-          </div>
-          <div className="conversation-flow" aria-hidden="true">
-            <span />
-            <span />
-            <span />
-          </div>
-          <div className="glance-card agent">
-            <span className="glance-label">Latest from Mira</span>
-            <p>{latestAgentTranscript || 'Mira’s streamed response will appear here.'}</p>
-          </div>
-        </div>
-
-        <div className="call-footer">
-          <span><i className="footer-dot blue" /> Server VAD</span>
-          <span><i className="footer-dot cyan" /> Streaming model</span>
-          <span><i className="footer-dot violet" /> Live audio</span>
-          {realtimeMeta && (
-            <span className="model-label">
-              {realtimeMeta.realtime_session?.model || 'Realtime model'}
-              {' · '}
-              {realtimeMeta.realtime_session?.audio?.output?.voice || 'voice'}
-            </span>
-          )}
-        </div>
-      </section>
     </div>
   );
 }

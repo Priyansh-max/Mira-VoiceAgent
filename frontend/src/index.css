@@ -718,7 +718,7 @@ button:focus-visible {
   color: #92a5bd;
 }
 
-/* The pipeline view is intentionally conversation-first. The legacy realtime
+/* The pipeline view is intentionally conversation-first. The Realtime
    panel continues to use the larger call-stage visual styles above. */
 .pipeline-call-stage {
   padding: 22px 470px 18px 26px;

@@ -69,7 +69,11 @@ def synthesize_with_timing(text: str) -> tuple[Optional[bytes], Optional[float],
     return b"".join(chunks), first_audio_ms, total_ms
 
 
-def stream_with_timing(text: str) -> Iterator[tuple[bytes, Optional[float], Optional[float]]]:
+def stream_with_timing(
+    text: str,
+    *,
+    response_format: str = "mp3",
+) -> Iterator[tuple[bytes, Optional[float], Optional[float]]]:
     """Yield TTS audio chunks with first-audio and final-total timing markers.
 
     Each yielded tuple is ``(chunk, first_audio_ms, total_ms)``. ``first_audio_ms``
@@ -86,7 +90,7 @@ def stream_with_timing(text: str) -> Iterator[tuple[bytes, Optional[float], Opti
         model=os.environ.get("TTS_MODEL", "gpt-4o-mini-tts"),
         voice=os.environ.get("TTS_VOICE", "marin"),
         input=text,
-        response_format="mp3",
+        response_format=response_format,
     ) as response:
         for chunk in response.iter_bytes():
             if not chunk:

@@ -6,6 +6,8 @@ import csv
 import io
 import json
 import os
+import queue as sync_queue
+import re
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
@@ -23,6 +25,8 @@ from backend.text_agent import OpenAITextAgent, TextAgentConfigError
 from backend.pipeline_agent import ChainedPipelineAgent, PipelineAgentConfigError
 from backend import stt
 from backend import tts
+from backend.realtime_transcription import RealtimeTranscriptionError, RealtimeTranscriber
+from backend.streaming_tts import DeepgramFluxSession, StreamingTTSError, get_streaming_tts_provider
 from backend.trace import TraceEvent, TraceStore
 from backend.config import VALID_RESPONSE_MODES, ResponseMode, get_response_mode
 from backend.latency import LatencySample, LatencyStore
@@ -234,6 +238,68 @@ def _process_pipeline_audio(
         )
     )
     return session, transcript or "", agent_result, stt_ms
+
+
+def _process_pipeline_transcript(
+    *,
+    session_id: str,
+    transcript: str,
+    stt_ms: float,
+    on_text: Any = None,
+) -> tuple[Any, str, dict[str, Any], float]:
+    """Run the existing agent/tool contract on a committed realtime transcript."""
+    try:
+        session = conversations.get_session(session_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Unknown session_id")
+
+    expected_field = expected_information_field(session)
+    clean_transcript = (transcript or "").strip()
+    if clean_transcript:
+        traces.emit(
+            TraceEvent(
+                session_id=session.session_id,
+                type="user_transcript",
+                message="Realtime transcript received",
+                data={"text": clean_transcript},
+            )
+        )
+    else:
+        traces.emit(
+            TraceEvent(
+                session_id=session.session_id,
+                type="recognition_repair",
+                message="Realtime transcription returned no final text",
+                data={"expected_field": expected_field},
+            )
+        )
+
+    try:
+        if clean_transcript:
+            agent_result = pipeline_agent.handle_text(session=session, text=clean_transcript, on_text=on_text)
+        else:
+            agent_result = pipeline_agent.handle_unrecognized_capture(
+                session=session,
+                expected_field=expected_field,
+            )
+    except (PipelineAgentConfigError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    traces.emit(
+        TraceEvent(
+            session_id=session.session_id,
+            type="assistant_transcript",
+            message="Assistant response generated",
+            data={
+                "text": agent_result["response_text"],
+                "response_mode": agent_result["response_mode"],
+                "has_tool_call": agent_result["has_tool_call"],
+                "tool_result": agent_result["tool_result"],
+                "tool_calls": agent_result["tool_calls"],
+            },
+        )
+    )
+    return session, clean_transcript, agent_result, stt_ms
 
 
 def _pipeline_metadata_payload(
@@ -643,41 +709,60 @@ async def pipeline_websocket(websocket: WebSocket, response_mode: str | None = Q
             data={"mode": "streaming_ws", "response_mode": session.response_mode},
         )
     )
-    await websocket.send_json(
-        {
-            "event": "session",
-            "session_id": session.session_id,
-            "response_mode": session.response_mode,
-            "pipeline_mode": "streaming_ws",
-        }
-    )
+    active_turn_id: str | None = None
 
+    async def send_partial(delta: str) -> None:
+        if active_turn_id:
+            await websocket.send_json({"event": "transcript_delta", "turn_id": active_turn_id, "delta": delta})
+
+    transcriber: RealtimeTranscriber | None = None
+    deepgram_tts: DeepgramFluxSession | None = None
     try:
+        streaming_tts_provider = get_streaming_tts_provider()
+        await websocket.send_json(
+            {
+                "event": "session",
+                "session_id": session.session_id,
+                "response_mode": session.response_mode,
+                "pipeline_mode": "realtime_stt_streaming",
+                "streaming_tts_provider": streaming_tts_provider,
+                "input_audio_format": "pcm16",
+                "input_sample_rate": 24000,
+            }
+        )
+        transcriber = await RealtimeTranscriber.connect(on_delta=send_partial)
+        if streaming_tts_provider == "deepgram":
+            deepgram_tts = await DeepgramFluxSession.connect()
+        await websocket.send_json({"event": "stt_ready", "session_id": session.session_id})
+
         while True:
             message = await websocket.receive_json()
-            if message.get("event") == "close":
+            event = message.get("event")
+            if event == "close":
                 break
-            if message.get("event") != "turn_audio":
-                await websocket.send_json({"event": "error", "detail": "Unsupported websocket event"})
+            if event == "speech_start":
+                active_turn_id = str(message.get("turn_id") or "")
+                continue
+            if event == "audio_frame":
+                if not transcriber:
+                    await websocket.send_json({"event": "error", "detail": "Realtime STT is unavailable"})
+                    continue
+                await transcriber.append(base64.b64decode(message.get("audio_base64") or ""))
+                continue
+            if event != "speech_end":
+                await websocket.send_json({"event": "error", "detail": "Expected speech_start, audio_frame, or speech_end"})
                 continue
 
-            backend_started_at = time.perf_counter()
-            turn_id = str(message.get("turn_id") or "")
-            audio_base64 = message.get("audio_base64") or ""
-            content_type = message.get("content_type") or "audio/wav"
-            audio_duration_ms = message.get("audio_duration_ms")
-            if not turn_id:
-                await websocket.send_json({"event": "error", "detail": "Missing turn_id"})
+            turn_id = str(message.get("turn_id") or active_turn_id or "")
+            if not turn_id or not transcriber:
+                await websocket.send_json({"event": "error", "detail": "Missing turn_id or realtime STT"})
                 continue
+            backend_started_at = time.perf_counter()
+            commit_started_at = time.perf_counter()
             try:
-                audio_bytes = base64.b64decode(audio_base64)
-                current_session, transcript, agent_result, stt_ms = _process_pipeline_audio(
-                    session_id=session.session_id,
-                    turn_id=turn_id,
-                    audio_bytes=audio_bytes,
-                    content_type=content_type,
-                    audio_duration_ms=float(audio_duration_ms) if audio_duration_ms else None,
-                )
+                await transcriber.commit()
+                transcript = await transcriber.final_transcript()
+                stt_ms = round((time.perf_counter() - commit_started_at) * 1000, 1)
             except HTTPException as exc:
                 await websocket.send_json({"event": "error", "turn_id": turn_id, "detail": exc.detail})
                 continue
@@ -685,76 +770,244 @@ async def pipeline_websocket(websocket: WebSocket, response_mode: str | None = Q
                 await websocket.send_json({"event": "error", "turn_id": turn_id, "detail": str(exc)})
                 continue
 
-            await websocket.send_json(
-                {
-                    "event": "metadata",
-                    **_pipeline_metadata_payload(
-                        session=current_session,
-                        turn_id=turn_id,
-                        transcript=transcript,
-                        agent_result=agent_result,
-                        stt_ms=stt_ms,
-                    ),
-                }
-            )
+            try:
+                current_session = conversations.get_session(session.session_id)
+            except KeyError:
+                await websocket.send_json({"event": "error", "turn_id": turn_id, "detail": "Unknown session"})
+                continue
+            await websocket.send_json({
+                "event": "metadata",
+                "session_id": session.session_id,
+                "turn_id": turn_id,
+                "transcript": transcript,
+                "response_text": "",
+                "response_mode": session.response_mode,
+                "has_tool_call": False,
+                "audio_media_type": "audio/pcm;rate=24000",
+                "tool_result": None,
+                "tool_calls": [],
+                "metrics": {"stt_ms": stt_ms},
+            })
 
+            text_queue: sync_queue.Queue[str] = sync_queue.Queue()
+            agent_future = asyncio.create_task(asyncio.to_thread(
+                _process_pipeline_transcript,
+                session_id=session.session_id,
+                transcript=transcript,
+                stt_ms=stt_ms,
+                on_text=text_queue.put,
+            ))
             tts_ttf_audio_ms: float | None = None
-            tts_total_ms: float | None = None
+            tts_total_ms = 0.0
             saw_audio = False
             try:
-                for chunk, first_audio_ms, total_ms in tts.stream_with_timing(agent_result["response_text"]):
-                    if first_audio_ms is not None:
-                        tts_ttf_audio_ms = first_audio_ms
-                    if total_ms is not None:
-                        tts_total_ms = total_ms
-                        continue
-                    if not chunk:
-                        continue
-                    saw_audio = True
-                    await websocket.send_json(
-                        {
-                            "event": "audio",
+                if deepgram_tts:
+                    streamed_text = False
+                    tts_started_at: float | None = None
+                    speech_complete = False
+
+                    async def handle_deepgram_event(provider_event: dict[str, Any]) -> None:
+                        nonlocal tts_ttf_audio_ms, tts_total_ms, saw_audio, speech_complete
+                        event_type = str(provider_event.get("type") or "")
+                        if event_type == "audio":
+                            chunk = provider_event.get("audio")
+                            if not isinstance(chunk, bytes) or not chunk:
+                                return
+                            first_audio_ms = None
+                            if tts_ttf_audio_ms is None and tts_started_at is not None:
+                                tts_ttf_audio_ms = round(
+                                    (time.perf_counter() - tts_started_at) * 1000,
+                                    1,
+                                )
+                                first_audio_ms = tts_ttf_audio_ms
+                            saw_audio = True
+                            await websocket.send_json({
+                                "event": "audio",
+                                "turn_id": turn_id,
+                                "audio_base64": base64.b64encode(chunk).decode("ascii"),
+                                "tts_ttf_audio_ms": first_audio_ms,
+                            })
+                            return
+                        if event_type == "SpeechMetadata":
+                            if tts_started_at is not None:
+                                tts_total_ms = round(
+                                    (time.perf_counter() - tts_started_at) * 1000,
+                                    1,
+                                )
+                            speech_complete = True
+                            return
+                        if event_type.lower() == "error":
+                            detail = (
+                                provider_event.get("description")
+                                or provider_event.get("message")
+                                or "Deepgram streaming TTS failed"
+                            )
+                            raise StreamingTTSError(str(detail))
+
+                    while not agent_future.done() or not text_queue.empty():
+                        did_work = False
+                        while True:
+                            try:
+                                delta = text_queue.get_nowait()
+                            except sync_queue.Empty:
+                                break
+                            did_work = True
+                            await websocket.send_json({
+                                "event": "response_delta",
+                                "turn_id": turn_id,
+                                "delta": delta,
+                            })
+                            if not streamed_text:
+                                streamed_text = True
+                                tts_started_at = time.perf_counter()
+                            await deepgram_tts.send_text(delta)
+
+                        while True:
+                            provider_event = deepgram_tts.next_event_nowait()
+                            if provider_event is None:
+                                break
+                            did_work = True
+                            await handle_deepgram_event(provider_event)
+
+                        if not did_work and not agent_future.done():
+                            await asyncio.sleep(0.005)
+
+                    current_session, clean_transcript, agent_result, _ = await agent_future
+                    if not streamed_text:
+                        response_text = agent_result["response_text"]
+                        await websocket.send_json({
+                            "event": "response_delta",
                             "turn_id": turn_id,
-                            "audio_base64": base64.b64encode(chunk).decode("ascii"),
-                            "tts_ttf_audio_ms": first_audio_ms,
-                        }
-                    )
-                if not saw_audio:
-                    await websocket.send_json({"event": "error", "turn_id": turn_id, "detail": "TTS synthesis failed"})
-                    continue
+                            "delta": response_text,
+                        })
+                        streamed_text = True
+                        tts_started_at = time.perf_counter()
+                        await deepgram_tts.send_text(response_text)
+
+                    await deepgram_tts.flush()
+                    while not speech_complete:
+                        await handle_deepgram_event(await deepgram_tts.next_event())
+                else:
+                    sentence_buffer = ""
+                    streamed_sentences = 0
+
+                    async def speak_sentence(sentence: str) -> None:
+                        nonlocal streamed_sentences, tts_ttf_audio_ms, tts_total_ms, saw_audio
+                        sentence = sentence.strip()
+                        if not sentence:
+                            return
+                        streamed_sentences += 1
+                        for chunk, first_audio_ms, total_ms in tts.stream_with_timing(
+                            sentence,
+                            response_format="pcm",
+                        ):
+                            if first_audio_ms is not None and tts_ttf_audio_ms is None:
+                                tts_ttf_audio_ms = first_audio_ms
+                            if total_ms is not None:
+                                tts_total_ms += total_ms
+                                continue
+                            if not chunk:
+                                continue
+                            saw_audio = True
+                            await websocket.send_json({
+                                "event": "audio",
+                                "turn_id": turn_id,
+                                "audio_base64": base64.b64encode(chunk).decode("ascii"),
+                                "tts_ttf_audio_ms": first_audio_ms,
+                            })
+
+                    while not agent_future.done() or not text_queue.empty():
+                        drained = False
+                        while True:
+                            try:
+                                delta = text_queue.get_nowait()
+                            except sync_queue.Empty:
+                                break
+                            drained = True
+                            sentence_buffer += delta
+                            await websocket.send_json({
+                                "event": "response_delta",
+                                "turn_id": turn_id,
+                                "delta": delta,
+                            })
+                            parts = re.split(r"(?<=[.!?])\s+", sentence_buffer)
+                            sentence_buffer = parts.pop() if parts else sentence_buffer
+                            for sentence in parts:
+                                await speak_sentence(sentence)
+                        if not drained and not agent_future.done():
+                            await asyncio.sleep(0.01)
+
+                    current_session, clean_transcript, agent_result, _ = await agent_future
+                    if sentence_buffer.strip():
+                        await speak_sentence(sentence_buffer)
+                    if streamed_sentences == 0:
+                        await websocket.send_json({
+                            "event": "response_delta",
+                            "turn_id": turn_id,
+                            "delta": agent_result["response_text"],
+                        })
+                        await speak_sentence(agent_result["response_text"])
             except Exception as exc:
-                await websocket.send_json({"event": "error", "turn_id": turn_id, "detail": f"TTS streaming failed: {exc}"})
+                await websocket.send_json({"event": "error", "turn_id": turn_id, "detail": str(exc)})
+                continue
+
+            await websocket.send_json({
+                "event": "metadata_update",
+                "turn_id": turn_id,
+                "response_text": agent_result["response_text"],
+                "response_mode": agent_result["response_mode"],
+                "has_tool_call": agent_result["has_tool_call"],
+                "tool_result": agent_result["tool_result"],
+                "tool_calls": agent_result["tool_calls"],
+                "metrics": {
+                    "stt_ms": stt_ms,
+                    "llm_ttft_ms": agent_result["llm_ttft_ms"],
+                    "llm_total_ms": agent_result["llm_total_ms"],
+                    "tool_round_trip_ms": agent_result["tool_round_trip_ms"],
+                },
+            })
+            if not saw_audio:
+                await websocket.send_json({"event": "error", "turn_id": turn_id, "detail": "TTS synthesis failed"})
                 continue
 
             backend_processing_ms = round((time.perf_counter() - backend_started_at) * 1000, 1)
-            stage_total_ms = sum(
-                value or 0
-                for value in (
-                    stt_ms,
-                    agent_result["llm_total_ms"],
-                    agent_result["tool_round_trip_ms"],
-                    tts_total_ms,
-                )
+            stage_total_ms = sum(value or 0 for value in (
+                stt_ms, agent_result["llm_total_ms"], agent_result["tool_round_trip_ms"], tts_total_ms,
+            ))
+            backend_other_ms = (
+                None
+                if deepgram_tts
+                else round(max(0, backend_processing_ms - stage_total_ms), 1)
             )
-            await websocket.send_json(
-                {
-                    "event": "done",
-                    "turn_id": turn_id,
-                    "metrics": {
-                        "stt_ms": stt_ms,
-                        "llm_ttft_ms": agent_result["llm_ttft_ms"],
-                        "llm_total_ms": agent_result["llm_total_ms"],
-                        "tool_round_trip_ms": agent_result["tool_round_trip_ms"],
-                        "tts_ttf_audio_ms": tts_ttf_audio_ms,
-                        "tts_total_ms": tts_total_ms,
-                        "backend_processing_ms": backend_processing_ms,
-                        "backend_other_ms": round(max(0, backend_processing_ms - stage_total_ms), 1),
-                    },
-                }
-            )
+            await websocket.send_json({
+                "event": "done",
+                "turn_id": turn_id,
+                "metrics": {
+                    "stt_ms": stt_ms,
+                    "llm_ttft_ms": agent_result["llm_ttft_ms"],
+                    "llm_total_ms": agent_result["llm_total_ms"],
+                    "tool_round_trip_ms": agent_result["tool_round_trip_ms"],
+                    "tts_ttf_audio_ms": tts_ttf_audio_ms,
+                    "tts_total_ms": tts_total_ms,
+                    "backend_processing_ms": backend_processing_ms,
+                    # Flux synthesis overlaps LLM generation, so subtracting
+                    # stage durations would invent a serial "other" value.
+                    "backend_other_ms": backend_other_ms,
+                },
+            })
+            active_turn_id = None
     except WebSocketDisconnect:
         pass
+    except (RealtimeTranscriptionError, StreamingTTSError) as exc:
+        try:
+            await websocket.send_json({"event": "error", "detail": str(exc)})
+        except Exception:
+            pass
     finally:
+        if deepgram_tts:
+            await deepgram_tts.close()
+        if transcriber:
+            await transcriber.close()
         conversations.delete_session(session.session_id)
         traces.clear_session(session.session_id)
 

@@ -4,7 +4,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 from openai import OpenAI
 
@@ -122,6 +122,7 @@ def _extract_tool_calls(
     chunks: Iterable[Any],
     *,
     started_at: Optional[float] = None,
+    on_text: Callable[[str], None] | None = None,
 ) -> tuple[str, list[Dict[str, Any]], Optional[float], float]:
     # The caller starts this clock before opening the provider stream so TTFT
     # includes request setup, network time, and the wait for the first delta.
@@ -139,6 +140,8 @@ def _extract_tool_calls(
             if first_delta_ms is None:
                 first_delta_ms = round((time.perf_counter() - started_at) * 1000, 1)
             text_parts.append(content)
+            if on_text:
+                on_text(content)
 
         for tool_call in getattr(delta, "tool_calls", None) or []:
             if first_delta_ms is None:
@@ -167,7 +170,13 @@ class ChainedPipelineAgent:
         self.tools = _chat_tool_schemas()
         self.router = RealtimeToolRouter()
 
-    def handle_text(self, *, session: SessionState, text: str) -> Dict[str, Any]:
+    def handle_text(
+        self,
+        *,
+        session: SessionState,
+        text: str,
+        on_text: Callable[[str], None] | None = None,
+    ) -> Dict[str, Any]:
         response_mode = session.response_mode
         messages = [
             {"role": "system", "content": REALTIME_AGENT_PROMPT},
@@ -195,6 +204,7 @@ class ChainedPipelineAgent:
             assistant_text, tool_calls, llm_ttft_ms, llm_total_ms = _extract_tool_calls(
                 stream,
                 started_at=llm_started_at,
+                on_text=on_text,
             )
         except Exception as exc:
             raise PipelineAgentConfigError(f"OpenAI pipeline planning call failed: {exc}") from exc
@@ -244,6 +254,7 @@ class ChainedPipelineAgent:
             messages=messages,
             tool_calls=tool_calls,
             tool_result=tool_result,
+            on_text=on_text,
         )
         combined_ttft_ms = llm_ttft_ms
         combined_total_ms = round((llm_total_ms or 0) + second_total_ms, 1)
@@ -376,6 +387,7 @@ class ChainedPipelineAgent:
         messages: list[Dict[str, Any]],
         tool_calls: list[Dict[str, Any]],
         tool_result: Dict[str, Any],
+        on_text: Callable[[str], None] | None = None,
     ) -> tuple[str, Optional[float], float]:
         call = tool_calls[0]
         call_id = call.get("id") or f"pipeline_tool_{int(time.time() * 1000)}"
@@ -411,6 +423,7 @@ class ChainedPipelineAgent:
             text, _, ttft_ms, total_ms = _extract_tool_calls(
                 stream,
                 started_at=llm_started_at,
+                on_text=on_text,
             )
         except Exception as exc:
             raise PipelineAgentConfigError(f"OpenAI post-tool response call failed: {exc}") from exc

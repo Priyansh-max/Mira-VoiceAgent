@@ -55,7 +55,7 @@ export default function LatencyPanel({ turns = [], summary, activeMode, status }
           const value = latest?.[key];
           const width = value == null ? 0 : Math.max(5, (value / maxStage) * 100);
           const displayLabel = key === 'tts_total_ms' && streamedPlayback
-            ? 'Full synthesis (background)'
+            ? 'Full synthesis (background, not counted)'
             : label;
           return (
             <div className="pipeline-row" key={key}>

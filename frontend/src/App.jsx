@@ -25,7 +25,7 @@ function VoiceControls({ voiceMode, responseMode, onModeChange, onResponseModeCh
           className={voiceMode === 'realtime' ? 'active' : ''}
           onClick={() => onModeChange('realtime')}
         >
-          Legacy
+          Realtime
         </button>
       </div>
       <div className="embedded-mode-switch embedded-response-switch" aria-label="Response mode">

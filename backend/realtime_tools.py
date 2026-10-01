@@ -115,9 +115,15 @@ class RealtimeToolRouter:
             raise RealtimeToolError("attempt must be a non-negative integer")
 
         caller_name = self._clean_optional(arguments.get("caller_name"))
-        caller_phone = self._clean_optional(arguments.get("caller_phone"))
-        order_id = self._clean_optional(arguments.get("order_id"))
-        ticket_id = self._clean_optional(arguments.get("ticket_id"))
+        caller_phone = self._normalize_digit_sequence(
+            self._clean_optional(arguments.get("caller_phone"))
+        )
+        order_id = self._normalize_digit_sequence(
+            self._clean_optional(arguments.get("order_id"))
+        )
+        ticket_id = self._normalize_digit_sequence(
+            self._clean_optional(arguments.get("ticket_id"))
+        )
         callback_time = self._clean_optional(arguments.get("callback_time"))
         return purpose, caller_name, caller_phone, order_id, ticket_id, callback_time, attempt
 
@@ -128,6 +134,15 @@ class RealtimeToolRouter:
         if not isinstance(value, str):
             raise RealtimeToolError("Optional tool fields must be strings or null")
         return value.strip()
+
+    @staticmethod
+    def _normalize_digit_sequence(value: str) -> str:
+        """Canonicalize speech-oriented separators without guessing identifier content."""
+        if not value:
+            return ""
+        if re.fullmatch(r"[\d\s,._()+-]+", value):
+            return "".join(re.findall(r"\d", value))
+        return value
 
     def _identity(
         self,
@@ -353,7 +368,7 @@ class RealtimeToolRouter:
             remainder = remainder.strip(" ,.-")
             resolved = f"{target.strftime('%B')} {target.day}, {target.year}"
             if not remainder:
-                return resolved
+                return ""
             lowered = remainder.lower()
             after_time = RealtimeToolRouter._resolve_after_time(remainder)
             if after_time:
@@ -365,9 +380,28 @@ class RealtimeToolRouter:
             elif lowered in {"morning", "afternoon", "evening", "night"}:
                 suffix = f"in the {lowered}"
             else:
-                suffix = remainder
+                return ""
             return f"{resolved} {suffix}"
-        return text
+
+        has_day = bool(
+            re.search(
+                r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            or re.search(
+                r"\b(?:january|february|march|april|may|june|july|august|"
+                r"september|october|november|december)\s+\d{1,2}\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+            or re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", text)
+        )
+        has_time = bool(
+            re.search(r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)", text, re.IGNORECASE)
+            or re.search(r"\b(?:noon|midnight|morning|afternoon|evening|night)\b", text, re.IGNORECASE)
+        )
+        return text if has_day and has_time else ""
 
     @staticmethod
     def _resolve_after_time(value: str) -> str:

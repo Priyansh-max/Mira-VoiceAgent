@@ -52,16 +52,23 @@ function base64ToBytes(base64) {
   return bytes;
 }
 
-function blobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = String(reader.result || '');
-      resolve(result.includes(',') ? result.split(',', 2)[1] : result);
-    };
-    reader.onerror = () => reject(reader.error || new Error('Could not read audio blob'));
-    reader.readAsDataURL(blob);
-  });
+function pcm16Base64(samples, inputRate, targetRate = 24000) {
+  const ratio = inputRate / targetRate;
+  const outputLength = Math.max(1, Math.floor(samples.length / ratio));
+  const buffer = new ArrayBuffer(outputLength * 2);
+  const view = new DataView(buffer);
+  for (let index = 0; index < outputLength; index += 1) {
+    const sourceIndex = Math.min(samples.length - 1, Math.floor(index * ratio));
+    const sample = Math.max(-1, Math.min(1, samples[sourceIndex] || 0));
+    view.setInt16(index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+  }
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const step = 0x8000;
+  for (let index = 0; index < bytes.length; index += step) {
+    binary += String.fromCharCode(...bytes.subarray(index, Math.min(index + step, bytes.length)));
+  }
+  return btoa(binary);
 }
 
 function createStreamingAudioPlayer(mediaType = 'audio/mpeg') {
@@ -120,6 +127,93 @@ function createStreamingAudioPlayer(mediaType = 'audio/mpeg') {
       await ready;
       ended = true;
       pump();
+    },
+  };
+}
+
+function createPcmStreamingAudioPlayer({ sampleRate = 24000, onEnded }) {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return null;
+
+  const context = new AudioContextClass({ sampleRate });
+  const sources = new Set();
+  let nextStartTime = 0;
+  let trailingByte = null;
+  let ended = false;
+  let stopped = false;
+  let firstScheduled = false;
+  let resolveFirstAudio;
+  const firstAudioPromise = new Promise((resolve) => {
+    resolveFirstAudio = resolve;
+  });
+
+  const finishIfDone = () => {
+    if (!ended || sources.size > 0 || stopped) return;
+    stopped = true;
+    void context.close();
+    onEnded?.();
+  };
+
+  return {
+    firstAudioPromise,
+    async append(incomingBytes) {
+      if (stopped || !incomingBytes?.length) return;
+      let bytes = incomingBytes;
+      if (trailingByte !== null) {
+        const joined = new Uint8Array(bytes.length + 1);
+        joined[0] = trailingByte;
+        joined.set(bytes, 1);
+        bytes = joined;
+        trailingByte = null;
+      }
+      if (bytes.length % 2 === 1) {
+        trailingByte = bytes[bytes.length - 1];
+        bytes = bytes.subarray(0, bytes.length - 1);
+      }
+      if (!bytes.length) return;
+
+      await context.resume();
+      const sampleCount = bytes.length / 2;
+      const audioBuffer = context.createBuffer(1, sampleCount, sampleRate);
+      const channel = audioBuffer.getChannelData(0);
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      for (let index = 0; index < sampleCount; index += 1) {
+        channel[index] = view.getInt16(index * 2, true) / 0x8000;
+      }
+
+      const source = context.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(context.destination);
+      sources.add(source);
+      const startAt = Math.max(context.currentTime + 0.025, nextStartTime);
+      nextStartTime = startAt + audioBuffer.duration;
+      source.onended = () => {
+        sources.delete(source);
+        source.disconnect();
+        finishIfDone();
+      };
+      source.start(startAt);
+
+      if (!firstScheduled) {
+        firstScheduled = true;
+        window.setTimeout(
+          () => resolveFirstAudio(performance.now()),
+          Math.max(0, (startAt - context.currentTime) * 1000),
+        );
+      }
+    },
+    end() {
+      ended = true;
+      finishIfDone();
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      for (const source of sources) {
+        try { source.stop(); } catch (_) { /* already stopped */ }
+      }
+      sources.clear();
+      void context.close();
     },
   };
 }
@@ -301,12 +395,15 @@ export default function ChainedVoicePanel({
     streamRef.current = null;
     activeTurnRef.current = null;
     if (playbackRef.current) {
-      const { audio, audioUrl } = playbackRef.current;
+      const { audio, audioUrl, stop } = playbackRef.current;
       playbackRef.current = null;
-      audio.pause();
-      audio.removeAttribute('src');
-      audio.load();
-      URL.revokeObjectURL(audioUrl);
+      if (stop) stop();
+      else if (audio) {
+        audio.pause();
+        audio.removeAttribute('src');
+        audio.load();
+        URL.revokeObjectURL(audioUrl);
+      }
     }
     if (websocketRef.current) {
       websocketRef.current.close();
@@ -326,7 +423,7 @@ export default function ChainedVoicePanel({
 
   const finishTurn = useCallback(async (audioBlob, turn) => {
     const activeSessionId = sessionIdRef.current;
-    if (!turn || !activeSessionId || audioBlob.size === 0) {
+    if (!turn || !activeSessionId || (transportMode === 'pipeline' && (!audioBlob || audioBlob.size === 0))) {
       busyRef.current = false;
       setStatus('listening');
       return;
@@ -344,9 +441,23 @@ export default function ChainedVoicePanel({
       let heardPromise = null;
       let playStarted = false;
       let streamPlayer = null;
+      let pcmPlayer = null;
       let incrementalPlayback = false;
+      let responseTurnId = turn.turnId;
+      let responseTextBuffer = '';
+      let responseTextVisible = false;
       const fallbackChunks = [];
       let fallbackMediaType = 'audio/mpeg';
+
+      const revealBufferedResponse = () => {
+        if (!mountedRef.current || sessionIdRef.current !== activeSessionId) return;
+        responseTextVisible = true;
+        setConversationMessages((previous) => previous.map((message) => (
+          message.id === `${responseTurnId}-assistant`
+            ? { ...message, text: responseTextBuffer || message.text }
+            : message
+        )));
+      };
 
       const startPlayback = async (audio, audioUrl) => {
         if (playStarted) return;
@@ -364,6 +475,7 @@ export default function ChainedVoicePanel({
           audio.addEventListener('playing', resolveOnce, { once: true });
           audio.addEventListener('timeupdate', resolveOnce, { once: true });
         });
+        void heardPromise.then(revealBufferedResponse);
         audio.addEventListener('ended', () => {
           URL.revokeObjectURL(audioUrl);
           if (playbackRef.current?.audio !== audio) return;
@@ -389,6 +501,8 @@ export default function ChainedVoicePanel({
         onMetadata: async (event) => {
             if (!mountedRef.current || sessionIdRef.current !== activeSessionId) return;
             result = event;
+            responseTurnId = event.turn_id;
+            responseTextBuffer = event.response_text || responseTextBuffer;
             fallbackMediaType = event.audio_media_type || 'audio/mpeg';
             setConversationMessages((previous) => [
               ...previous,
@@ -400,15 +514,64 @@ export default function ChainedVoicePanel({
               {
                 id: `${event.turn_id}-assistant`,
                 role: 'assistant',
-                text: event.response_text,
+                text: responseTextVisible ? responseTextBuffer : '',
                 tool_calls: normalizeToolCalls(event),
               },
             ]);
+          },
+        onResponseDelta: (event) => {
+            if (!mountedRef.current || sessionIdRef.current !== activeSessionId) return;
+            responseTextBuffer += event.delta || '';
+            if (!responseTextVisible) return;
+            setConversationMessages((previous) => previous.map((message) => (
+              message.id === `${event.turn_id}-assistant`
+                ? { ...message, text: responseTextBuffer }
+                : message
+            )));
+          },
+        onMetadataUpdate: (event) => {
+            if (!mountedRef.current || sessionIdRef.current !== activeSessionId) return;
+            result = { ...(result || {}), ...event, metrics: { ...(result?.metrics || {}), ...(event.metrics || {}) } };
+            responseTextBuffer = event.response_text || responseTextBuffer;
+            setConversationMessages((previous) => previous.map((message) => (
+              message.id === `${event.turn_id}-assistant`
+                  ? {
+                    ...message,
+                    text: responseTextVisible ? responseTextBuffer : message.text,
+                    tool_calls: normalizeToolCalls(event),
+                  }
+                : message
+            )));
           },
         onAudio: async (event) => {
             if (!mountedRef.current || sessionIdRef.current !== activeSessionId) return;
             const bytes = base64ToBytes(event.audio_base64);
             if (!firstAudioChunkAt) firstAudioChunkAt = performance.now();
+            if (fallbackMediaType.startsWith('audio/pcm')) {
+              if (!pcmPlayer) {
+                pcmPlayer = createPcmStreamingAudioPlayer({
+                  sampleRate: 24000,
+                  onEnded: () => {
+                    if (sessionIdRef.current !== activeSessionId) return;
+                    playbackRef.current = null;
+                    setIsAgentSpeaking(false);
+                    busyRef.current = false;
+                    if (mountedRef.current) setStatus('listening');
+                  },
+                });
+                if (!pcmPlayer) throw new Error('This browser cannot play streaming PCM audio.');
+                audioPreparedAt = performance.now();
+                playbackRequestedAt = performance.now();
+                heardPromise = pcmPlayer.firstAudioPromise;
+                void heardPromise.then(revealBufferedResponse);
+                playbackRef.current = { stop: pcmPlayer.stop };
+                setIsAgentSpeaking(true);
+                setStatus('speaking');
+              }
+              incrementalPlayback = true;
+              await pcmPlayer.append(bytes);
+              return;
+            }
             if (!streamPlayer) {
               streamPlayer = createStreamingAudioPlayer(fallbackMediaType);
               audioPreparedAt = performance.now();
@@ -451,20 +614,11 @@ export default function ChainedVoicePanel({
             resolve,
             reject,
           };
-          blobToBase64(audioBlob)
-            .then((audioBase64) => {
-              socket.send(JSON.stringify({
-                event: 'turn_audio',
-                turn_id: turn.turnId,
-                content_type: audioBlob.type || 'audio/wav',
-                audio_duration_ms: turn.audioDurationMs,
-                audio_base64: audioBase64,
-              }));
-            })
-            .catch((error) => {
-              pendingStreamTurnRef.current = null;
-              reject(error);
-            });
+          socket.send(JSON.stringify({
+            event: 'speech_end',
+            turn_id: turn.turnId,
+            audio_duration_ms: turn.audioDurationMs,
+          }));
         });
       } else {
         throw new Error(`Unsupported pipeline transport: ${transportMode}`);
@@ -473,7 +627,9 @@ export default function ChainedVoicePanel({
 
       if (!mountedRef.current || sessionIdRef.current !== activeSessionId || !result) return;
 
-      if (streamPlayer) {
+      if (pcmPlayer) {
+        pcmPlayer.end();
+      } else if (streamPlayer) {
         await streamPlayer.end();
       } else if (fallbackChunks.length > 0) {
         const audioBlobOut = new Blob(fallbackChunks, { type: fallbackMediaType });
@@ -586,12 +742,35 @@ export default function ChainedVoicePanel({
       };
       activeTurnRef.current = turn;
       busyRef.current = true;
+      if (transportMode === 'streaming') {
+        const socket = websocketRef.current;
+        if (socket?.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ event: 'speech_start', turn_id: turn.turnId }));
+          for (const preRollSamples of turn.pcmChunks) {
+            socket.send(JSON.stringify({
+              event: 'audio_frame',
+              turn_id: turn.turnId,
+              audio_base64: pcm16Base64(preRollSamples, sampleRate),
+            }));
+          }
+        }
+      }
       setIsUserSpeaking(true);
       setStatus('user_speaking');
       return;
     }
 
     turn.pcmChunks.push(samples);
+    if (transportMode === 'streaming') {
+      const socket = websocketRef.current;
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          event: 'audio_frame',
+          turn_id: turn.turnId,
+          audio_base64: pcm16Base64(samples, sampleRate),
+        }));
+      }
+    }
     turn.peakRms = Math.max(turn.peakRms, rms);
 
     if (rms >= turn.vadThreshold) {
@@ -626,11 +805,16 @@ export default function ChainedVoicePanel({
       setStatus('listening');
       return;
     }
-    const encodingStartedAt = performance.now();
-    const encodedAudio = encodeWav(turn.pcmChunks, turn.sampleRate);
-    turn.audioEncodingMs = duration(encodingStartedAt, performance.now()) || 0;
+    let encodedAudio = null;
+    if (transportMode === 'pipeline') {
+      const encodingStartedAt = performance.now();
+      encodedAudio = encodeWav(turn.pcmChunks, turn.sampleRate);
+      turn.audioEncodingMs = duration(encodingStartedAt, performance.now()) || 0;
+    } else {
+      turn.audioEncodingMs = 0;
+    }
     void finishTurn(encodedAudio, turn);
-  }, [finishTurn]);
+  }, [finishTurn, transportMode]);
 
   const connect = useCallback(async () => {
     const attemptId = connectAttemptRef.current + 1;
@@ -650,27 +834,52 @@ export default function ChainedVoicePanel({
         const socket = new WebSocket(backendWebSocketUrl('/pipeline/ws', responseMode));
         streamingSocket = socket;
         meta = await new Promise((resolve, reject) => {
+          let sessionMeta = null;
+          let streamReady = false;
           const timeoutId = window.setTimeout(() => {
-            reject(new Error('Streaming socket connection timed out'));
-          }, 10000);
+            socket.close();
+            reject(new Error('Realtime STT did not become ready within 20 seconds'));
+          }, 20000);
           socket.onmessage = async (message) => {
             try {
               const event = JSON.parse(message.data);
               if (event.event === 'session') {
-                window.clearTimeout(timeoutId);
-                resolve({
+                sessionMeta = {
                   session_id: event.session_id,
                   response_mode: event.response_mode,
                   pipeline_mode: event.pipeline_mode,
-                });
+                };
+                return;
+              }
+              if (event.event === 'stt_ready') {
+                window.clearTimeout(timeoutId);
+                if (!sessionMeta) {
+                  reject(new Error('Streaming STT became ready before session initialization'));
+                  return;
+                }
+                streamReady = true;
+                resolve(sessionMeta);
                 return;
               }
               const pending = pendingStreamTurnRef.current;
-              if (!pending) return;
+              if (!pending) {
+                if (event.event === 'error') {
+                  const error = new Error(event.detail || 'Streaming pipeline failed');
+                  window.clearTimeout(timeoutId);
+                  reject(error);
+                }
+                return;
+              }
               if (event.turn_id && event.turn_id !== pending.turnId) return;
-              if (event.event === 'metadata') {
-                await pending.handlers.onMetadata?.(event);
-              } else if (event.event === 'audio') {
+                if (event.event === 'metadata') {
+                  await pending.handlers.onMetadata?.(event);
+                } else if (event.event === 'transcript_delta') {
+                  pending.handlers.onTranscriptDelta?.(event);
+                } else if (event.event === 'response_delta') {
+                  pending.handlers.onResponseDelta?.(event);
+                } else if (event.event === 'metadata_update') {
+                  pending.handlers.onMetadataUpdate?.(event);
+                } else if (event.event === 'audio') {
                 await pending.handlers.onAudio?.(event);
               } else if (event.event === 'done') {
                 await pending.handlers.onDone?.(event);
@@ -693,6 +902,10 @@ export default function ChainedVoicePanel({
             reject(new Error('Streaming socket failed to connect'));
           };
           socket.onclose = () => {
+            if (!streamReady) {
+              window.clearTimeout(timeoutId);
+              reject(new Error('Streaming backend closed before realtime STT was ready'));
+            }
             const pending = pendingStreamTurnRef.current;
             if (pending) {
               pendingStreamTurnRef.current = null;

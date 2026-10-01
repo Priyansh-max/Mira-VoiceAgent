@@ -1,6 +1,6 @@
 # Mira low-latency voice agent
 
-Mira is a customer-success voice agent whose primary demo is an explicit browser VAD → OpenAI STT → OpenAI LLM → OpenAI TTS pipeline backed by FastAPI. The previous OpenAI Realtime/WebRTC implementation remains available as a legacy comparison. Both paths include per-turn latency instrumentation and two controlled post-tool response modes for the assignment benchmark.
+Mira is a customer-success voice agent whose primary demo is an explicit browser VAD → OpenAI STT → OpenAI LLM → OpenAI TTS pipeline backed by FastAPI. The OpenAI Realtime/WebRTC implementation remains available as a Realtime comparison mode. Both paths include per-turn latency instrumentation and two controlled post-tool response modes for the assignment benchmark.
 
 ## Response modes
 
@@ -18,7 +18,7 @@ The flag changes only post-tool response composition. STT, VAD, models, voice, t
 
 ## Conversation context and safe state
 
-The primary pipeline keeps a short rolling conversational history for the active call and does not perform a separate summarization request. The legacy Realtime path lets the Realtime session own its model context. In both paths, backend workflow state remains separate from the model transcript and is deleted when the call disconnects.
+The primary pipeline keeps a short rolling conversational history for the active call and does not perform a separate summarization request. Realtime mode lets the Realtime session own its model context. In both paths, backend workflow state remains separate from the model transcript and is deleted when the call disconnects.
 
 The prompt is deliberately limited to five stable instruction sections: `identity`, `behavior`, `tools`, `principles`, and `guardrails`. Mutable facts do not go into the prompt. Identity, pending purpose, and per-field request attempts remain explicit backend `SessionState` fields, while current record values come from tools. This server-owned state prevents the model from resetting `attempt` and asking for the same information again.
 
@@ -94,7 +94,7 @@ Each completed spoken turn records:
 | TTS time-to-first-audio | TTS request start to first received audio bytes |
 | End-to-heard audio | Last locally voiced frame to the browser's first playback event |
 
-The legacy OpenAI Realtime path is fused speech-to-speech, so its STT/LLM/TTS values are event-boundary proxies rather than isolated provider request timings. End-to-heard remains the primary user-perceived metric on both paths.
+OpenAI Realtime mode is fused speech-to-speech, so its STT/LLM/TTS values are event-boundary proxies rather than isolated provider request timings. End-to-heard remains the primary user-perceived metric on both paths.
 
 Samples are appended to `backend/data/latency_samples.jsonl` and reloaded after backend restarts. Raw data is available from:
 
@@ -134,4 +134,4 @@ npm.cmd run build
 6. Transition actions are chained locally, so lookup or callback does not require another model decision.
 7. In `speech_directive` mode, FastAPI sends the selected directive text straight to TTS.
 8. The browser starts playback, records the first heard-audio milestone, and shows the turn beside the live latency breakdown.
-9. Disconnect closes capture/playback resources and idempotently deletes backend session state and trace history. The legacy tab retains the previous WebRTC/Realtime implementation for comparison.
+9. Disconnect closes capture/playback resources and idempotently deletes backend session state and trace history. The Realtime tab retains the WebRTC implementation for comparison.

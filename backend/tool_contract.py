@@ -25,15 +25,24 @@ def _shared_parameters() -> Dict[str, Any]:
             },
             "caller_phone": {
                 "type": ["string", "null"],
-                "description": "The caller's phone number or last four digits when supplied; otherwise null.",
+                "description": (
+                    "The caller's phone number or last four digits as continuous digits with no "
+                    "spoken separators; otherwise null."
+                ),
             },
             "order_id": {
                 "type": ["string", "null"],
-                "description": "The order ID when supplied; otherwise null.",
+                "description": (
+                    "The order ID as one continuous digit string with no commas, spaces, or "
+                    "spoken separators; otherwise null."
+                ),
             },
             "ticket_id": {
                 "type": ["string", "null"],
-                "description": "The ticket ID when supplied; otherwise null.",
+                "description": (
+                    "The ticket ID as one continuous digit string with no commas, spaces, or "
+                    "spoken separators; otherwise null."
+                ),
             },
             "callback_time": {
                 "type": ["string", "null"],
@@ -75,8 +84,8 @@ def grouped_tool_schemas(*, include_strict: bool = True) -> list[Dict[str, Any]]
             "Look up the current request after customer_identity returns action ready_for_lookup."
         ),
         "support_callback": (
-            "Route the caller to human support when identity cannot be completed, the caller "
-            "declines requested information, or the request cannot be handled safely."
+            "Request or schedule a human-support callback. Use this tool both to ask for the "
+            "preferred callback day and time and, after the caller answers, to schedule it."
         ),
     }
     schemas = [
